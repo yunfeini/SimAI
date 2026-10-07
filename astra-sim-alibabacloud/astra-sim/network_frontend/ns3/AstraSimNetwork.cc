@@ -329,9 +329,6 @@ static void StartJob(const SimAiMultiJob::JobSpec& job,
       throw std::runtime_error("job placement exceeds GPU nodes");
     }
   }
-  const bool full_server_layout =
-      placement.num_gpus % gpus_per_job_node == 0;
-
   // SimCCL keeps ranks local to a job.  The network frontend is responsible
   // for translating those local ranks to the selected physical nodes.
   std::vector<int> physical_gpus;
@@ -341,28 +338,26 @@ static void StartJob(const SimAiMultiJob::JobSpec& job,
   }
   std::vector<int> physical_switches;
   std::vector<int> logical_switches;
-  std::vector<uint32_t> selected_servers;
-  const uint32_t logical_gpus_per_node = full_server_layout
-                                             ? gpus_per_job_node
-                                             : placement.num_gpus;
-  for (uint32_t local = 0; local < placement.num_gpus;
-       local += logical_gpus_per_node) {
+  std::vector<uint32_t> rank_server;
+  rank_server.reserve(placement.num_gpus);
+  for (uint32_t local = 0; local < placement.num_gpus; ++local) {
     const uint32_t server = placement.gpu_ids[local] / gpus_per_job_node;
-    if (full_server_layout) {
-      for (uint32_t rank = local; rank < local + logical_gpus_per_node; ++rank) {
-        if (placement.gpu_ids[rank] / gpus_per_job_node != server) {
-          throw std::runtime_error("placement splits a physical GPU server");
-        }
-      }
-    }
     if (server >= NVswitchs.size()) {
       throw std::runtime_error("job placement has no NVSwitch mapping");
     }
-    selected_servers.push_back(server);
-    physical_switches.push_back(NVswitchs[server]);
-    logical_switches.push_back(static_cast<int>(placement.num_gpus +
-                                                selected_servers.size() - 1));
+    rank_server.push_back(server);
   }
+  for (uint32_t server : rank_server) {
+    if (std::find(physical_switches.begin(), physical_switches.end(),
+                  NVswitchs[server]) == physical_switches.end()) {
+      physical_switches.push_back(NVswitchs[server]);
+      logical_switches.push_back(static_cast<int>(placement.num_gpus +
+                                                  logical_switches.size()));
+    }
+  }
+  const bool placement_spans_partial_servers =
+      placement.num_gpus % gpus_per_job_node != 0 ||
+      physical_switches.size() > 1;
 
   g_job_expected_ranks[job.job_id] = placement.num_gpus;
   g_job_finished_ranks[job.job_id] = 0;
@@ -387,7 +382,7 @@ static void StartJob(const SimAiMultiJob::JobSpec& job,
         {static_cast<int>(placement.num_gpus)}, {1}, "", workload_path, 1, 1,
         1, 1, 0, result_path, job.name, true, false, gpu_type,
         {static_cast<int>(placement.num_gpus)}, logical_switches,
-        logical_gpus_per_node, job.job_id);
+        gpus_per_job_node, job.job_id);
     if (g_job_systems[runtime_rank]->workload == nullptr ||
         g_job_systems[runtime_rank]->workload->all_gpus !=
             static_cast<int>(placement.num_gpus)) {
@@ -395,8 +390,17 @@ static void StartJob(const SimAiMultiJob::JobSpec& job,
     }
     g_job_systems[runtime_rank]->job_id = job.job_id;
     g_job_systems[runtime_rank]->num_gpus = placement.num_gpus;
-    g_job_systems[runtime_rank]->nvswitch_id =
-        logical_switches[local / logical_gpus_per_node];
+    if (placement_spans_partial_servers) {
+      // A Sys currently exposes one NVSwitch id, while this placement may
+      // span multiple partial physical servers. Keep collectives in the
+      // generic ring/tree network path; NVLS needs a per-rank switch map.
+      g_job_systems[runtime_rank]->NVSwitchs.clear();
+    }
+    const int physical_switch = NVswitchs[rank_server[local]];
+    const auto switch_it = std::find(physical_switches.begin(),
+                                     physical_switches.end(), physical_switch);
+    g_job_systems[runtime_rank]->nvswitch_id = logical_switches[
+        static_cast<size_t>(switch_it - physical_switches.begin())];
     g_job_systems[runtime_rank]->workload_finished_callback =
         [](uint32_t finished_job_id) {
           uint32_t& finished = g_job_finished_ranks[finished_job_id];
