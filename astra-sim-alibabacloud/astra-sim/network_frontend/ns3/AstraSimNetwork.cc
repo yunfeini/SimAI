@@ -448,7 +448,7 @@ static int user_param_prase(int argc,char * argv[],struct user_param* user_param
       std::cout<<"-n    network topo"<<std::endl;
       std::cout<<"-c    network_conf"<<std::endl;
       std::cout<<"-j    CSV job file: job_id,workload,gpus,submit_time_ns[,name[,gpu_memory_bytes[,host_memory_bytes[,communication_bytes]]]]"<<std::endl;
-      std::cout<<"-p    multi-job policy: first-fit or best-fit"<<std::endl;
+      std::cout<<"-p    multi-job policy: fcfs, first-fit, best-fit, fgd, or crux"<<std::endl;
       std::cout<<"-m    per-GPU memory capacity in bytes (0 means unspecified)"<<std::endl;
       std::cout<<"-H    per-GPU host memory capacity in bytes (0 means unspecified)"<<std::endl;
       std::cout<<"-R    per-GPU resource CSV: gpu_id,gpu_memory_bytes,host_memory_bytes"<<std::endl;

@@ -27,7 +27,7 @@
 | `-n` | `--network-topo` | 网络拓扑文件路径 | 必填 |
 | `-c` | `--config` | 仿真配置文件路径 | 必填 |
 | `-j` | `--jobs` | 多任务 CSV manifest | 可选 |
-| `-p` | `--policy` | 多任务策略：`first-fit` 或 `best-fit` | `first-fit` |
+| `-p` | `--policy` | 多任务策略：`fcfs`、`first-fit`、`best-fit`、`fgd` 或 `crux` | `first-fit` |
 | `-m` | `--gpu-memory` | 每张 GPU 显存容量（字节），`0` 表示未指定 | `0` |
 | `-H` | `--host-memory` | 每张 GPU 对应主机内存容量（字节），`0` 表示未指定 | `0` |
 | `-R` | `--gpu-resources` | 每张 GPU 资源 CSV：`gpu_id,gpu_memory_bytes,host_memory_bytes` | 可选 |
@@ -61,6 +61,10 @@ JOBS_FILE=./example/cluster-trace-v2026-spot-gpu/simai_fcfs/multi_jobs.csv \
 ```
 
 `-p best-fit` 优先选择满足需求且剩余显存较小的 GPU。GPU 容量不同时使用 `-R` 覆盖单卡资源。`-L` 输出资源快照以及任务完成时的 `e2e_latency_ns` 端到端时延。每个任务拥有独立的 `Sys`、workload 和 SimCCL group，网络回调使用 `(job_id, tag, src, dst)` 隔离。
+
+`-p fgd` 启用碎片梯度下降放置启发式：评估候选连续 GPU 区间释放后留下的空闲碎片，选择碎片最小的放置。`-p crux` 根据通信量、GPU 数量和排队时间提升通信关键任务优先级，并选择跨服务器范围最小的物理 GPU 集合。
+
+这两个策略是论文思想在调度层的实现。FGD 当前优化放置后剩余 GPU 的碎片度；Crux 使用通信量作为关键度信号，并结合 GPU 数量和排队时间排序，同时最小化所选物理 GPU 的服务器跨度。任务内部逻辑 collective rank 与物理 GPU ID 分离，因此两种策略都可以把任务放到不连续的物理 GPU 上，同时保持 SimCCL 的任务内 rank 组正确。
 
 #### 泊松到达推理任务
 

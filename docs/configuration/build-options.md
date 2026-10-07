@@ -27,7 +27,7 @@
 | `-n` | `--network-topo` | Path to network topology file | Required |
 | `-c` | `--config` | Path to simulation config file | Required |
 | `-j` | `--jobs` | CSV manifest for multi-job simulation | Optional |
-| `-p` | `--policy` | Multi-job policy: `first-fit` or `best-fit` | `first-fit` |
+| `-p` | `--policy` | Multi-job policy: `fcfs`, `first-fit`, `best-fit`, `fgd`, or `crux` | `first-fit` |
 | `-m` | `--gpu-memory` | Per-GPU memory capacity in bytes; `0` leaves it unspecified | `0` |
 | `-H` | `--host-memory` | Per-GPU host-memory capacity in bytes; `0` leaves it unspecified | `0` |
 | `-R` | `--gpu-resources` | Per-GPU resource CSV: `gpu_id,gpu_memory_bytes,host_memory_bytes` | Optional |
@@ -61,6 +61,10 @@ The current `Spectrum-X_128g_8gps_100Gbps_A100` topology has 128 GPUs; jobs abov
 ```
 
 Use `-p best-fit` to prefer GPUs with the least remaining memory that satisfy the request. Use `-R` when GPU capacities differ. `-L` writes resource snapshots and per-job `e2e_latency_ns` completion latency. Each job has its own `Sys`, workload and SimCCL group; network callbacks are keyed by `(job_id, tag, src, dst)`.
+
+`-p fgd` enables a fragmentation gradient descent placement heuristic. It scores candidate contiguous windows by the free GPU fragmentation they leave behind and chooses the lowest score. `-p crux` prioritizes waiting jobs by communication volume, GPU count, and queue age, then places them on the lowest server-span physical GPU set available.
+
+These are scheduler-layer implementations inspired by the two papers. FGD currently optimizes the post-placement free-GPU fragmentation score. Crux currently uses communication bytes as the criticality signal, combines it with requested GPU count and queue age, and minimizes the physical server span of the selected GPUs. The simulator keeps the task's logical collective ranks separate from physical GPU IDs, so both policies can place a task on non-contiguous physical GPUs while preserving its SimCCL rank group.
 
 #### Poisson inference arrivals
 

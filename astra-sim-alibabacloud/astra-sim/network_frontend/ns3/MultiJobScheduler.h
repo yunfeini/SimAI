@@ -21,7 +21,7 @@
 
 namespace SimAiMultiJob {
 
-enum class Policy { FirstFit, BestFit, FCFS };
+enum class Policy { FirstFit, BestFit, FCFS, FragmentationGradient, Crux };
 
 struct JobSpec {
   uint32_t job_id = 0;
@@ -343,9 +343,120 @@ class Scheduler {
     return true;
   }
 
+  uint64_t FragmentationScore(const std::vector<uint32_t>& selected) const {
+    std::vector<bool> occupied(total_gpus_, false);
+    for (uint32_t gpu_id : selected) {
+      if (gpu_id < occupied.size()) occupied[gpu_id] = true;
+    }
+    uint32_t free_count = 0;
+    uint32_t largest_run = 0;
+    uint32_t run = 0;
+    for (bool used : occupied) {
+      if (!used) {
+        ++free_count;
+        ++run;
+        largest_run = std::max(largest_run, run);
+      } else {
+        run = 0;
+      }
+    }
+    if (free_count == 0) return 0;
+    // Number of free GPUs outside the largest contiguous free interval.
+    return free_count - largest_run;
+  }
+
+  bool FindFragmentationPlacement(const JobSpec& job,
+                                  Placement* placement) const {
+    std::vector<uint32_t> candidates;
+    for (uint32_t gpu_id = 0; gpu_id < total_gpus_; ++gpu_id) {
+      if (Fits(resources_[gpu_id], job)) candidates.push_back(gpu_id);
+    }
+    if (candidates.size() < job.num_gpus) return false;
+    std::vector<uint32_t> best;
+    uint64_t best_score = std::numeric_limits<uint64_t>::max();
+    // The scheduler is intended for moderate GPU counts; enumerate contiguous
+    // windows first, then use a deterministic sparse fallback.
+    for (uint32_t begin = 0; begin + job.num_gpus <= total_gpus_; ++begin) {
+      std::vector<uint32_t> selected;
+      bool valid = true;
+      for (uint32_t i = 0; i < job.num_gpus; ++i) {
+        const uint32_t gpu_id = begin + i;
+        if (!Fits(resources_[gpu_id], job)) {
+          valid = false;
+          break;
+        }
+        selected.push_back(gpu_id);
+      }
+      if (!valid) continue;
+      const uint64_t score = FragmentationScore(selected);
+      if (score < best_score) {
+        best_score = score;
+        best = selected;
+      }
+    }
+    if (best.empty()) {
+      best.assign(candidates.begin(), candidates.begin() + job.num_gpus);
+    }
+    placement->num_gpus = job.num_gpus;
+    placement->gpu_ids = best;
+    return true;
+  }
+
+  bool FindCruxPlacement(const JobSpec& job, Placement* placement) const {
+    // Crux-style priority: communication-heavy and GPU-heavy jobs receive
+    // priority at the queue level; placement minimizes cross-server edges.
+    std::vector<uint32_t> candidates;
+    for (uint32_t gpu_id = 0; gpu_id < total_gpus_; ++gpu_id) {
+      if (Fits(resources_[gpu_id], job)) candidates.push_back(gpu_id);
+    }
+    if (candidates.size() < job.num_gpus) return false;
+    std::vector<uint32_t> best;
+    uint32_t best_span = std::numeric_limits<uint32_t>::max();
+    for (uint32_t begin = 0; begin < total_gpus_; ++begin) {
+      std::vector<uint32_t> window;
+      for (uint32_t gpu_id : candidates) {
+        if (gpu_id >= begin &&
+            gpu_id < begin + job.num_gpus + gpus_per_server_ - 1) {
+          window.push_back(gpu_id);
+        }
+      }
+      if (window.size() < job.num_gpus) continue;
+      window.resize(job.num_gpus);
+      const uint32_t span = window.back() / gpus_per_server_ -
+                            window.front() / gpus_per_server_;
+      if (span < best_span) {
+        best_span = span;
+        best = window;
+      }
+    }
+    if (best.empty()) {
+      best.assign(candidates.begin(), candidates.begin() + job.num_gpus);
+    }
+    placement->num_gpus = job.num_gpus;
+    placement->gpu_ids = best;
+    return true;
+  }
+
+  double CruxPriority(const PendingJob& pending) const {
+    const double communication = static_cast<double>(pending.job.communication_bytes);
+    const double gpu_count = static_cast<double>(pending.job.num_gpus);
+    const double wait = schedule_time_ns_ >= pending.submit_time_ns
+                            ? static_cast<double>(schedule_time_ns_ - pending.submit_time_ns)
+                            : 0.0;
+    return communication * std::max(1.0, gpu_count) + wait;
+  }
+
   void Schedule() {
     if (policy_ == Policy::FCFS) {
       ScheduleFcfs();
+      return;
+    }
+    if (policy_ == Policy::FragmentationGradient) {
+      ScheduleFragmentationGradient();
+      return;
+    }
+    if (policy_ == Policy::Crux) {
+      ScheduleCrux();
       return;
     }
     for (auto it = pending_.begin(); it != pending_.end();) {
@@ -376,6 +487,63 @@ class Scheduler {
       if (start_callback_) {
         start_callback_(active.job, active.placement);
       }
+    }
+  }
+
+  void Activate(const PendingJob& pending, const Placement& placement) {
+    for (uint32_t gpu_id : placement.gpu_ids) {
+      resources_[gpu_id].reserved = true;
+      resources_[gpu_id].gpu_memory_used_bytes += pending.job.gpu_memory_bytes;
+      resources_[gpu_id].host_memory_used_bytes += pending.job.host_memory_bytes;
+    }
+    ActiveJob active;
+    active.job = pending.job;
+    active.placement = placement;
+    active.submit_time_ns = pending.submit_time_ns;
+    active.start_time_ns = schedule_time_ns_;
+    active_.push_back(active);
+    LogSnapshot("schedule", schedule_time_ns_, active.job.job_id,
+                active.job.name, &active.job,
+                active.start_time_ns >= active.submit_time_ns
+                    ? active.start_time_ns - active.submit_time_ns : 0,
+                0, 0);
+    if (start_callback_) start_callback_(active.job, active.placement);
+  }
+
+  void ScheduleFragmentationGradient() {
+    for (auto it = pending_.begin(); it != pending_.end();) {
+      Placement placement;
+      placement.job_id = it->job.job_id;
+      if (!FindFragmentationPlacement(it->job, &placement)) {
+        ++it;
+        continue;
+      }
+      PendingJob pending = *it;
+      it = pending_.erase(it);
+      Activate(pending, placement);
+    }
+  }
+
+  void ScheduleCrux() {
+    while (!pending_.empty()) {
+      auto best_it = pending_.end();
+      Placement best_placement;
+      double best_priority = -1.0;
+      for (auto it = pending_.begin(); it != pending_.end(); ++it) {
+        Placement placement;
+        placement.job_id = it->job.job_id;
+        if (!FindCruxPlacement(it->job, &placement)) continue;
+        const double priority = CruxPriority(*it);
+        if (best_it == pending_.end() || priority > best_priority) {
+          best_it = it;
+          best_priority = priority;
+          best_placement = placement;
+        }
+      }
+      if (best_it == pending_.end()) return;
+      PendingJob pending = *best_it;
+      pending_.erase(best_it);
+      Activate(pending, best_placement);
     }
   }
 
@@ -569,6 +737,13 @@ inline std::vector<GpuResource> LoadGpuResources(
 inline Policy ParsePolicy(const std::string& value) {
   if (value == "fcfs" || value == "fifo") {
     return Policy::FCFS;
+  }
+  if (value == "fgd" || value == "fragmentation-gradient" ||
+      value == "fragmentation_gradient") {
+    return Policy::FragmentationGradient;
+  }
+  if (value == "crux") {
+    return Policy::Crux;
   }
   if (value == "first-fit" || value == "first_fit") {
     return Policy::FirstFit;
