@@ -27,6 +27,7 @@ struct timespec_t {
 enum req_type_e { UINT8, BFLOAT16, FP32 };
 
 struct ncclFlowTag {
+  uint32_t job_id;
   int channel_id;
   int chunk_id;
   int current_flow_id;    
@@ -48,6 +49,7 @@ struct ncclFlowTag {
   int protocol  = -1; // NCCL_PROTO_UNDEF
   int gpus_per_node = -1; // for link type detection (NVLINK vs NET); -1 = use fallback 8
   ncclFlowTag():
+    job_id(0),
     channel_id(-1),
     chunk_id(-1),
     current_flow_id(-1),
@@ -68,8 +70,10 @@ struct ncclFlowTag {
       uint64_t _flow_size,
       void* _pQps,
       int _tag_id,
-      bool _nvls_on)
-      : channel_id(_channel_id),
+      bool _nvls_on,
+      uint32_t _job_id = 0)
+      : job_id(_job_id),
+        channel_id(_channel_id),
         chunk_id(_chunk_id),
         current_flow_id(_current_flow_id),
         child_flow_id(_child_flow_id),

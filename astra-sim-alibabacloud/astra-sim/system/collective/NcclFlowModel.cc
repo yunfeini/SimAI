@@ -537,6 +537,7 @@ bool NcclFlowModel::ready(int channel_id, int flow_id) {
     rcv_req.layerNum = layer_num;
     rcv_req.reqCount = packet.msg_size;
     rcv_req.tag = channel_id;
+    rcv_req.flowTag.job_id = stream->owner->job_id;
     RecvPacketEventHadndlerData* ehd = new RecvPacketEventHadndlerData(
         stream,
         stream->owner->id,
@@ -584,19 +585,21 @@ bool NcclFlowModel::ready(int channel_id, int flow_id) {
   snd_req.flowTag.child_flow_id = -1;
   snd_req.flowTag.tree_flow_list =
       this->_flow_models[std::make_pair(channel_id, flow_id)].child_flow_id;
+  snd_req.flowTag.job_id = stream->owner->job_id;
   snd_req.flowTag.sender_node = id;
   snd_req.flowTag.receiver_node = packet.preferred_dest;
   snd_req.flowTag.pQps = this->pQps;
   snd_req.flowTag.algorithm = m_algorithm;
   snd_req.flowTag.protocol = m_protocol;
-  snd_req.flowTag.gpus_per_node = Sys::all_generators[id] ? Sys::all_generators[id]->ngpus_per_node : -1;
+  snd_req.flowTag.gpus_per_node = Sys::all_generators[id + stream->owner->npu_offset]
+      ? Sys::all_generators[id + stream->owner->npu_offset]->ngpus_per_node : -1;
   if (this->comType == ComType::All_Reduce_NVLS)
     snd_req.flowTag.nvls_on = true;
   else
     snd_req.flowTag.nvls_on = false;
   SendPacketEventHandlerData* send_ehd = new SendPacketEventHandlerData(
       stream,
-      id,
+      id + stream->owner->npu_offset,
       packet.preferred_dest,
       channel_id,
       EventType::PacketSentFinshed);
@@ -672,6 +675,7 @@ bool NcclFlowModel::phy_ready(int channel_id,int flow_id) {
     rcv_req.layerNum = layer_num;
     rcv_req.reqCount = flow.flow_size;
     rcv_req.tag = channel_id;
+    rcv_req.flowTag.job_id = stream->owner->job_id;
     RecvPacketEventHadndlerData* ehd = new RecvPacketEventHadndlerData(
         stream,
         stream->owner->id,
@@ -719,19 +723,21 @@ bool NcclFlowModel::phy_ready(int channel_id,int flow_id) {
   snd_req.flowTag.child_flow_id = -1;
   snd_req.flowTag.tree_flow_list =
       this->_flow_models[std::make_pair(channel_id, flow_id)].child_flow_id;
+  snd_req.flowTag.job_id = stream->owner->job_id;
   snd_req.flowTag.sender_node = id;
   snd_req.flowTag.receiver_node = flow.dest;
   snd_req.flowTag.pQps = this->pQps;
   snd_req.flowTag.algorithm = m_algorithm;
   snd_req.flowTag.protocol = m_protocol;
-  snd_req.flowTag.gpus_per_node = Sys::all_generators[id] ? Sys::all_generators[id]->ngpus_per_node : -1;
+  snd_req.flowTag.gpus_per_node = Sys::all_generators[id + stream->owner->npu_offset]
+      ? Sys::all_generators[id + stream->owner->npu_offset]->ngpus_per_node : -1;
   if (this->comType == ComType::All_Reduce_NVLS)
     snd_req.flowTag.nvls_on = true;
   else
     snd_req.flowTag.nvls_on = false;
   SendPacketEventHandlerData* send_ehd = new SendPacketEventHandlerData(
       stream,
-      id,
+      id + stream->owner->npu_offset,
       flow.dest,
       channel_id,
       EventType::PacketSentFinshed);

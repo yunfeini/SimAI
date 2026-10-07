@@ -34,13 +34,17 @@ LICENSE file in the root directory of this source tree.
 #include <cmath>
 #include <numeric>
 
-MockNccl::MockNcclGroup* GlobalGroup = nullptr;
-
 namespace AstraSim {
 std::atomic<bool> Sys::g_sys_inCriticalSection(false);
 Tick Sys::offset = 0;
 uint8_t* Sys::dummy_data = new uint8_t[2];
 std::vector<Sys*> Sys::all_generators;
+std::map<uint32_t, MockNccl::MockNcclGroup*> Sys::global_groups;
+bool Sys::multi_job_mode = false;
+
+void Sys::SetMultiJobMode(bool enabled) {
+  multi_job_mode = enabled;
+}
 
 Sys::~Sys() {
   end_sim_time = std::chrono::high_resolution_clock::now();
@@ -99,20 +103,26 @@ Sys::~Sys() {
   if (offline_greedy != nullptr)
     delete offline_greedy;
   bool shouldExit = true;
-  
-  for(int i = 0; i < num_gpus; ++ i) {
-    auto& a = all_generators[i];
-    if (a != nullptr) {
+  for (Sys* generator : all_generators) {
+    if (generator != nullptr) {
       shouldExit = false;
       break;
     }
+  }
+
+  // The ns-3 multi-job scheduler owns simulator completion.  A completed
+  // job may be followed by another job using different physical GPUs.
+  if (multi_job_mode) {
+    shouldExit = false;
   }
 
   if (shouldExit) {
     exitSimLoop("Exiting");
   }
   #else
-    exitSimLoop("Exiting");
+    if (!multi_job_mode) {
+      exitSimLoop("Exiting");
+    }
   #endif
 }
 
@@ -138,7 +148,8 @@ Sys::Sys(
     GPUType _gpu_type,
     std::vector<int>_all_gpus,
     std::vector<int>_NVSwitchs,
-    int _ngpus_per_node) {
+    int _ngpus_per_node,
+    uint32_t _job_id) {
   scheduler_unit = nullptr;
   vLevels = nullptr;
   memBus = nullptr;
@@ -156,6 +167,8 @@ Sys::Sys(
   this->MEM = MEM;
   this->id = id;
   this->npu_offset=npu_offset;
+  this->job_id = _job_id;
+  this->global_group = nullptr;
   this->method = "baseline";
   this->finished_workloads = 0;
   this->streams_finished = 0;
@@ -480,6 +493,7 @@ int Sys::sim_send(
     sim_request* request,
     void (*msg_handler)(void* fun_arg),
     void* fun_arg) {
+  request->flowTag.job_id = job_id;
   if (delay == 0 && fun_arg == nullptr) {
     Sys::sysCriticalSection cs;
       
@@ -592,6 +606,7 @@ int Sys::sim_recv(
     sim_request* request,
     void (*msg_handler)(void* fun_arg),
     void* fun_arg) {
+  request->flowTag.job_id = job_id;
   if (delay == 0) {
     NI->sim_recv(buffer, count, type, src, tag, request, msg_handler, fun_arg);
   } else {
@@ -1385,9 +1400,11 @@ std::map<std::pair<int,int>, MockNccl::SingleFlow> Sys::generate_nvl_test_flow_m
 }
 
 bool Sys::mock_nccl_grobal_group_init(){
-  if (GlobalGroup != nullptr)
+  auto existing = global_groups.find(job_id);
+  if (existing != global_groups.end()) {
+    global_group = existing->second;
     return true;
-  else {
+  } else {
     int total_nodes = this->total_nodes;
     int TP_size = workload->model_parallel_npu_group == 0
         ? total_nodes
@@ -1396,7 +1413,8 @@ bool Sys::mock_nccl_grobal_group_init(){
     int DP_size = all_gpus[0] / (TP_size * PP_size);
     int EP_size = workload->expert_parallel_npu_group;
     int DP_EP_size = DP_size / EP_size;
-    GlobalGroup = new MockNccl::MockNcclGroup(all_gpus[0],ngpus_per_node,TP_size,DP_size,PP_size,EP_size,DP_EP_size,NVSwitchs,gpu_type);
+    global_group = new MockNccl::MockNcclGroup(all_gpus[0],ngpus_per_node,TP_size,DP_size,PP_size,EP_size,DP_EP_size,NVSwitchs,gpu_type);
+    global_groups[job_id] = global_group;
     return true;
   }
 }
@@ -1411,19 +1429,19 @@ bool Sys::mock_nccl_comms_init(){
     int DP_EP_size = DP_size / EP_size;
     MockNccl::MockNcclComm* pComm;
     if (TP_size > 1) {
-      pComm = new MockNccl::MockNcclComm(id,MockNccl::GroupType::TP,GlobalGroup);
+      pComm = new MockNccl::MockNcclComm(id,MockNccl::GroupType::TP,global_group);
       mock_nccl_comms[TP] = pComm;
     }
     if(DP_size > 1) {
-      pComm = new MockNccl::MockNcclComm(id,MockNccl::GroupType::DP,GlobalGroup);
+      pComm = new MockNccl::MockNcclComm(id,MockNccl::GroupType::DP,global_group);
       mock_nccl_comms[DP] = pComm;
     }
     if(EP_size > 1 ){
-      pComm = new MockNccl::MockNcclComm(id,MockNccl::GroupType::EP,GlobalGroup);
+      pComm = new MockNccl::MockNcclComm(id,MockNccl::GroupType::EP,global_group);
       mock_nccl_comms[EP] = pComm;
     }
     if(DP_EP_size > 1){
-      pComm = new MockNccl::MockNcclComm(id,MockNccl::GroupType::DP_EP,GlobalGroup);
+      pComm = new MockNccl::MockNcclComm(id,MockNccl::GroupType::DP_EP,global_group);
       mock_nccl_comms[DP_EP] = pComm;
     }
     return true;
@@ -1733,15 +1751,14 @@ void Sys::exitSimLoop(std::string msg) {
   return;
 }
 Tick Sys::boostedTick() {
-  Sys* ts = all_generators[0];
-  if (ts == nullptr) {
-    for (int i = 1; i < all_generators.size(); i++) {
-      if (all_generators[i] != nullptr) {
-        ts = all_generators[i];
-        break;
-      }
+  Sys* ts = nullptr;
+  for (Sys* generator : all_generators) {
+    if (generator != nullptr) {
+      ts = generator;
+      break;
     }
   }
+  if (ts == nullptr) return offset;
   timespec_t tmp = ts->NI->sim_get_time();
   Tick tick = tmp.time_val / CLOCK_PERIOD;
   return tick + offset;

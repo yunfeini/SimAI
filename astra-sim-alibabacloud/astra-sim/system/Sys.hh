@@ -18,6 +18,7 @@ LICENSE file in the root directory of this source tree.
 #include <sstream>
 #include <tuple>
 #include <vector>
+#include <functional>
 #include "AstraMemoryAPI.hh"
 #include "AstraNetworkAPI.hh"
 #include "Callable.hh"
@@ -89,6 +90,7 @@ class Sys : public Callable {
   int finished_workloads;
   int id;
   int npu_offset;
+  uint32_t job_id;
   int nvswitch_id; 
   int num_gpus;
   std::vector<int>NVSwitchs; 
@@ -158,6 +160,9 @@ class Sys : public Callable {
   int total_nodes;
   static Tick offset;
   static std::vector<Sys*> all_generators;
+  static std::map<uint32_t, MockNccl::MockNcclGroup*> global_groups;
+  static bool multi_job_mode;
+  static void SetMultiJobMode(bool enabled);
   static uint8_t* dummy_data;
   uint64_t streams_injected;
   uint64_t streams_finished;
@@ -212,8 +217,12 @@ class Sys : public Callable {
       CallData* callData,
       Tick& cycles);
   void call_events();
+  std::function<void(uint32_t)> workload_finished_callback;
   void workload_finished() {
     finished_workloads++;
+    if (workload_finished_callback) {
+      workload_finished_callback(job_id);
+    }
   };
   static Tick boostedTick();
   static void exiting();
@@ -246,7 +255,8 @@ class Sys : public Callable {
       GPUType _gpu_type,
       std::vector<int> _all_gpus,
       std::vector<int> _NVSwitchs,
-      int _ngpus_per_node);
+      int _ngpus_per_node,
+      uint32_t _job_id = 0);
 
   void iterate();
   bool initialize_sys(std::string name);
@@ -397,6 +407,7 @@ class Sys : public Callable {
   static std::atomic<bool> g_sys_inCriticalSection;
   
   std::map<ParallelStrategy,MockNccl::MockNcclComm*> mock_nccl_comms;
+  MockNccl::MockNcclGroup* global_group;
   std::map<std::pair<int,int>, MockNccl::SingleFlow> generate_net_test_flow_model(uint64_t data_size, int nums);
   std::map<std::pair<int,int>, MockNccl::SingleFlow> generate_nvl_test_flow_model(uint64_t data_size, int nums);
   std::shared_ptr<void> generate_flow_model(ParallelStrategy comm_ps,uint64_t data_size, ComType collective_type);
