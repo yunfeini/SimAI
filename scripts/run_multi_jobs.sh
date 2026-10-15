@@ -16,6 +16,10 @@ HOST_MEMORY_BYTES="${HOST_MEMORY_BYTES:-0}"
 GPU_RESOURCE_FILE="${GPU_RESOURCE_FILE:-}"
 SCHEDULER_LOG="${SCHEDULER_LOG:-${ROOT_DIR}/SimAI_scheduler.csv}"
 
+if [[ -n "${POLICIES:-}" ]]; then
+  exec sh "${SCRIPT_DIR}/compare_scheduler_policies.sh" "$@"
+fi
+
 if [[ ! -x "${SIMAI_BIN}" ]]; then
   echo "SimAI binary not found or not executable: ${SIMAI_BIN}" >&2
   echo "Build it first or set SIMAI_BIN=/path/to/SimAI_simulator." >&2

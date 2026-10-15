@@ -171,6 +171,7 @@ Sys::Sys(
   this->global_group = nullptr;
   this->method = "baseline";
   this->finished_workloads = 0;
+  this->destroy_started = false;
   this->streams_finished = 0;
   this->streams_injected = 0;
   this->first_phase_streams = 0;
@@ -1737,8 +1738,10 @@ void Sys::call_events() {
   event_queue.erase(Sys::boostedTick());
   cs.ExitSection();
   }
-  FINISH_CHECK: if ((finished_workloads == 1 && event_queue.size() == 0 && pending_sends.size() == 0) ||
-      initialized == false) {
+  FINISH_CHECK: if (!multi_job_mode && !destroy_started &&
+      ((finished_workloads == 1 && event_queue.size() == 0 && pending_sends.size() == 0) ||
+       initialized == false)) {
+    destroy_started = true;
     delete this;
   }
 
@@ -2120,8 +2123,10 @@ void Sys::handleEvent(void* arg) {
           sendhd->receiverNodeId, sendhd->tag)] = false;
       
       if(node->event_queue.find(Sys::boostedTick())==node->event_queue.end())
-        if ((node->finished_workloads == 1 && node->event_queue.size() == 0 && node->pending_sends.size() == 0) ||
-      node->initialized == false) {
+        if (!multi_job_mode && !node->destroy_started &&
+            ((node->finished_workloads == 1 && node->event_queue.size() == 0 && node->pending_sends.size() == 0) ||
+             node->initialized == false)) {
+        node->destroy_started = true;
         delete node;
       }
       #ifdef NS3_MTP  

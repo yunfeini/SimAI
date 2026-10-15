@@ -88,6 +88,7 @@ class Sys : public Callable {
   AstraNetworkAPI* NI;
   AstraMemoryAPI* MEM;
   int finished_workloads;
+  bool destroy_started;
   int id;
   int npu_offset;
   uint32_t job_id;

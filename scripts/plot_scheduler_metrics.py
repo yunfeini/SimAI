@@ -16,6 +16,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
+from scheduler_plot_style import (
+    DEFAULT_CURVE_BINS, DEFAULT_MAX_LATENCY_JOBS, curve_note,
+    label_bars, plot_curve,
+)
 
 @dataclass
 class Snapshot:
@@ -208,8 +212,10 @@ def plot_job_timeline(plt, Patch, metrics, first_ns, last_ns, output_dir, dpi):
     plt.close(figure)
 
 
-def plot_job_latencies(plt, metrics, output_dir, dpi):
-    finished = [metric for metric in metrics.values() if metric.finish_ns is not None]
+def plot_job_latencies(plt, metrics, output_dir, dpi,
+                       max_jobs=DEFAULT_MAX_LATENCY_JOBS):
+    all_finished = [metric for metric in metrics.values() if metric.finish_ns is not None]
+    finished = sorted(all_finished, key=lambda item: (-(item.e2e_ns or 0), item.job_id))[:max_jobs]
     finished.sort(key=lambda item: item.job_id)
     figure, (axis, histogram) = plt.subplots(2, 1, figsize=(13, 8), gridspec_kw={"height_ratios": [2, 1]})
     if not finished:
@@ -223,17 +229,23 @@ def plot_job_latencies(plt, metrics, output_dir, dpi):
         queue = [(metric.queue_ns or 0) / scale for metric in finished]
         service = [(metric.service_ns or 0) / scale for metric in finished]
         e2e = [(metric.e2e_ns or 0) / scale for metric in finished]
-        axis.bar([position - width for position in positions], queue, width, label="queue")
-        axis.bar(positions, service, width, label="service")
-        axis.bar([position + width for position in positions], e2e, width, label="end-to-end")
-        axis.set_title("Per-job Latency")
+        for x, values, label in (
+                ([position - width for position in positions], queue, "queue"),
+                (positions, service, "service"),
+                ([position + width for position in positions], e2e, "end-to-end")):
+            label_bars(axis, axis.bar(x, values, width, label=label), rotation=90)
+        axis.set_title("Latency: {} slowest of {} completed jobs".format(
+            len(finished), len(all_finished)))
         axis.set_ylabel("Latency ({})".format(unit))
         axis.set_xticks(positions)
         axis.set_xticklabels(["job {}".format(metric.job_id) for metric in finished], rotation=45, ha="right")
         axis.grid(axis="y", alpha=0.25)
         axis.legend()
-        histogram.hist(e2e, bins=min(20, max(1, len(e2e))), color="#4c78a8", edgecolor="white")
-        histogram.set_title("End-to-end Latency Distribution")
+        all_e2e = [(metric.e2e_ns or 0) / scale for metric in all_finished]
+        _, _, bars = histogram.hist(all_e2e, bins=min(15, max(1, len(all_e2e))),
+                                    color="#4c78a8", edgecolor="white")
+        label_bars(histogram, bars, counts=True)
+        histogram.set_title("End-to-end Latency Distribution (all completed jobs)")
         histogram.set_xlabel("End-to-end latency ({})".format(unit))
         histogram.set_ylabel("Completed jobs")
         histogram.grid(axis="y", alpha=0.25)
@@ -305,6 +317,31 @@ def snapshot_resource_metrics(snapshot: Snapshot) -> Dict[str, Optional[float]]:
     }
 
 
+def detect_warmup_end(snapshots: List[Snapshot], warmup_fraction: float) -> int:
+    """Return the first snapshot time at the maximum observed GPU occupancy."""
+    if not snapshots:
+        return 0
+    occupancies = [
+        snapshot_resource_metrics(snapshot)["gpu_allocation_ratio"] or 0.0
+        for snapshot in snapshots
+    ]
+    maximum = max(occupancies)
+    threshold = maximum * warmup_fraction
+    for snapshot, occupancy in zip(snapshots, occupancies):
+        if occupancy >= threshold:
+            return snapshot.time_ns
+    return snapshots[0].time_ns
+
+
+def post_warmup_jobs(metrics: Dict[int, JobMetric], warmup_ns: int) -> Dict[int, JobMetric]:
+    return {
+        job_id: metric
+        for job_id, metric in metrics.items()
+        if (metric.submit_ns is not None and metric.submit_ns >= warmup_ns)
+        or (metric.start_ns is not None and metric.start_ns >= warmup_ns)
+    }
+
+
 def plot_resource_statistics(plt, snapshots, output_dir, dpi):
     metrics = [snapshot_resource_metrics(snapshot) for snapshot in snapshots]
     figure, axes = plt.subplots(2, 2, figsize=(13, 8))
@@ -320,39 +357,43 @@ def plot_resource_statistics(plt, snapshots, output_dir, dpi):
     ]
     for axis, (values, title, x_label, y_label) in zip(axes.flat, chart_data):
         if values:
-            axis.hist(values, bins=min(30, max(5, len(set(values)))), color="#4c78a8", edgecolor="white")
+            _, _, bars = axis.hist(values, bins=min(15, max(5, len(set(values)))),
+                                    color="#4c78a8", edgecolor="white")
+            label_bars(axis, bars, counts=True)
         else:
             axis.text(0.5, 0.5, "No data", ha="center", va="center")
         axis.set_title(title)
-        axis.set_xlabel(x_label)
-        axis.set_ylabel(y_label)
+        axis.set_xlabel(y_label)
+        axis.set_ylabel(x_label)
         axis.grid(axis="y", alpha=0.25)
     save_figure(figure, output_dir / "resource_statistics.png", dpi)
     plt.close(figure)
 
 
-def plot_resource_timeseries(plt, snapshots, first_ns, last_ns, output_dir, dpi):
+def plot_resource_timeseries(plt, snapshots, first_ns, last_ns, output_dir, dpi,
+                             curve_bins=DEFAULT_CURVE_BINS):
     scale, unit = time_scale(max(1, last_ns - first_ns))
     times = [(snapshot.time_ns - first_ns) / scale for snapshot in snapshots]
     metrics = [snapshot_resource_metrics(snapshot) for snapshot in snapshots]
     figure, axes = plt.subplots(3, 1, figsize=(13, 10), sharex=True)
-    axes[0].step(times, [item["gpu_allocation_ratio"] * 100 for item in metrics], where="post",
-                 color="#4c78a8", label="GPU allocation")
+    plot_curve(axes[0], times, [item["gpu_allocation_ratio"] * 100 for item in metrics],
+               "GPU allocation", "#4c78a8", curve_bins)
     axes[0].set_ylabel("Allocated (%)")
     axes[0].set_ylim(0, 100)
     axes[0].set_title("Resource Occupancy and Fragmentation Over Time")
-    axes[1].step(times, [item["free_fragment_count"] for item in metrics], where="post",
-                 color="#e45756", label="free fragments")
-    axes[1].step(times, [item["largest_free_run"] for item in metrics], where="post",
-                 color="#54a24b", label="largest contiguous free run")
-    axes[1].set_ylabel("GPU count")
-    axes[2].step(times, [item["active_job_count"] for item in metrics], where="post",
-                 color="#f58518", label="active jobs")
+    plot_curve(axes[1], times, [item["free_fragmentation_ratio"] * 100 for item in metrics],
+               "Free-GPU fragmentation", "#e45756", curve_bins)
+    axes[1].set_ylabel("Fragmentation (%)")
+    axes[1].set_ylim(0, 100)
+    plot_curve(axes[2], times, [item["active_job_count"] for item in metrics],
+               "Active jobs", "#f58518", curve_bins)
     axes[2].set_ylabel("Jobs")
     axes[2].set_xlabel("Simulation time ({})".format(unit))
     for axis in axes:
         axis.grid(alpha=0.25)
         axis.legend(loc="upper right")
+    axes[2].set_ylim(bottom=0)
+    axes[2].set_xlabel("Simulation time ({})\n{}".format(unit, curve_note(curve_bins)), fontsize=9)
     save_figure(figure, output_dir / "resource_occupancy_timeseries.png", dpi)
     plt.close(figure)
 
@@ -433,7 +474,8 @@ def write_resource_summary(snapshots, output_dir: Path) -> None:
             ])
 
 
-def plot_gpu_utilization(plt, snapshots, first_ns, last_ns, output_dir, dpi):
+def plot_gpu_utilization(plt, snapshots, first_ns, last_ns, output_dir, dpi,
+                         show_memory=True, curve_bins=DEFAULT_CURVE_BINS):
     scale, unit = time_scale(max(1, last_ns - first_ns))
     times = [(snapshot.time_ns - first_ns) / scale for snapshot in snapshots]
     usage = [snapshot_utilization(snapshot) for snapshot in snapshots]
@@ -441,36 +483,47 @@ def plot_gpu_utilization(plt, snapshots, first_ns, last_ns, output_dir, dpi):
     total = [item[1] for item in usage]
     gpu_memory = [item[2] for item in usage]
     host_memory = [item[3] for item in usage]
-    figure, (allocation_axis, memory_axis) = plt.subplots(2, 1, figsize=(13, 8), sharex=True)
-    allocation_axis.step(times, busy, where="post", color="#4c78a8", label="busy GPUs")
+    if show_memory:
+        figure, (allocation_axis, memory_axis) = plt.subplots(2, 1, figsize=(13, 8), sharex=True)
+    else:
+        figure, allocation_axis = plt.subplots(1, 1, figsize=(13, 4.5))
+    plot_curve(allocation_axis, times, busy, "busy GPUs", "#4c78a8", curve_bins)
     allocation_axis.step(times, total, where="post", color="#9aa5b1", linestyle="--", label="total GPUs")
     allocation_axis.set_title("GPU Allocation Utilization")
     allocation_axis.set_ylabel("GPU count")
     allocation_axis.set_ylim(bottom=0)
     allocation_axis.grid(alpha=0.25)
     allocation_axis.legend()
-    valid_gpu_memory = [(time, ratio) for time, ratio in zip(times, gpu_memory) if ratio is not None]
-    valid_host_memory = [(time, ratio) for time, ratio in zip(times, host_memory) if ratio is not None]
-    if valid_gpu_memory or valid_host_memory:
+    if show_memory:
+        valid_gpu_memory = [(time, ratio) for time, ratio in zip(times, gpu_memory) if ratio is not None]
+        valid_host_memory = [(time, ratio) for time, ratio in zip(times, host_memory) if ratio is not None]
+    else:
+        valid_gpu_memory = []
+        valid_host_memory = []
+    if show_memory and (valid_gpu_memory or valid_host_memory):
         if valid_gpu_memory:
-            memory_axis.step([item[0] for item in valid_gpu_memory], [item[1] * 100 for item in valid_gpu_memory],
-                             where="post", label="GPU memory")
+            plot_curve(memory_axis, [item[0] for item in valid_gpu_memory],
+                       [item[1] * 100 for item in valid_gpu_memory], "GPU memory", bins=curve_bins)
         if valid_host_memory:
-            memory_axis.step([item[0] for item in valid_host_memory], [item[1] * 100 for item in valid_host_memory],
-                             where="post", label="host memory")
+            plot_curve(memory_axis, [item[0] for item in valid_host_memory],
+                       [item[1] * 100 for item in valid_host_memory], "host memory", bins=curve_bins)
         memory_axis.set_ylim(0, 100)
         memory_axis.set_ylabel("Resource used (%)")
         memory_axis.legend()
         memory_axis.grid(alpha=0.25)
-    else:
+    elif show_memory:
         memory_axis.text(0.5, 0.5, "GPU/host memory capacities were not configured", ha="center", va="center")
         memory_axis.set_yticks([])
-    memory_axis.set_xlabel("Simulation time ({})".format(unit))
+    if show_memory:
+        memory_axis.set_xlabel("Simulation time ({})".format(unit))
+    else:
+        allocation_axis.set_xlabel("Simulation time ({})".format(unit))
     save_figure(figure, output_dir / "gpu_utilization.png", dpi)
     plt.close(figure)
 
 
-def plot_gpu_resource_heatmap(plt, snapshots, gpu_ids, output_dir, dpi):
+def plot_gpu_resource_heatmap(plt, snapshots, gpu_ids, output_dir, dpi,
+                              show_memory=True):
     if not gpu_ids:
         return
     import numpy as np
@@ -485,35 +538,42 @@ def plot_gpu_resource_heatmap(plt, snapshots, gpu_ids, output_dir, dpi):
             capacity = as_int(row.get("gpu_memory_capacity_bytes"))
             if capacity:
                 memory[index, column] = as_int(row.get("gpu_memory_used_bytes")) * 100.0 / capacity
-    figure, (busy_axis, memory_axis) = plt.subplots(2, 1, figsize=(14, max(7, len(gpu_ids) * 0.28 + 3)))
+    if show_memory:
+        figure, (busy_axis, memory_axis) = plt.subplots(2, 1, figsize=(14, max(7, len(gpu_ids) * 0.28 + 3)))
+    else:
+        figure, busy_axis = plt.subplots(1, 1, figsize=(14, max(5, len(gpu_ids) * 0.18 + 2)))
     busy_image = busy_axis.imshow(busy, aspect="auto", interpolation="nearest", cmap="YlGnBu", vmin=0, vmax=1)
     busy_axis.set_title("Per-GPU Allocation State by Scheduler Snapshot")
     busy_axis.set_ylabel("Physical GPU")
     busy_axis.set_yticks(range(len(gpu_ids)))
     busy_axis.set_yticklabels(gpu_ids)
     figure.colorbar(busy_image, ax=busy_axis, label="busy")
-    if np.isfinite(memory).any():
+    if show_memory and np.isfinite(memory).any():
         memory_image = memory_axis.imshow(memory, aspect="auto", interpolation="nearest", cmap="magma", vmin=0, vmax=100)
         figure.colorbar(memory_image, ax=memory_axis, label="GPU memory used (%)")
-    else:
+    elif show_memory:
         memory_axis.text(0.5, 0.5, "GPU memory capacities were not configured", ha="center", va="center")
-    memory_axis.set_title("Per-GPU Memory Use by Scheduler Snapshot")
-    memory_axis.set_ylabel("Physical GPU")
-    memory_axis.set_yticks(range(len(gpu_ids)))
-    memory_axis.set_yticklabels(gpu_ids)
-    tick_count = min(10, len(snapshots))
-    if tick_count:
-        step = max(1, len(snapshots) // tick_count)
-        ticks = list(range(0, len(snapshots), step))
-        labels = ["{} ns".format(snapshots[index].time_ns) for index in ticks]
-        memory_axis.set_xticks(ticks)
-        memory_axis.set_xticklabels(labels, rotation=30, ha="right")
-    memory_axis.set_xlabel("Scheduler snapshot time")
+    if show_memory:
+        memory_axis.set_title("Per-GPU Memory Use by Scheduler Snapshot")
+        memory_axis.set_ylabel("Physical GPU")
+        memory_axis.set_yticks(range(len(gpu_ids)))
+        memory_axis.set_yticklabels(gpu_ids)
+        tick_count = min(10, len(snapshots))
+        if tick_count:
+            step = max(1, len(snapshots) // tick_count)
+            ticks = list(range(0, len(snapshots), step))
+            labels = ["{} ns".format(snapshots[index].time_ns) for index in ticks]
+            memory_axis.set_xticks(ticks)
+            memory_axis.set_xticklabels(labels, rotation=30, ha="right")
+        memory_axis.set_xlabel("Scheduler snapshot time")
+    else:
+        busy_axis.set_xlabel("Scheduler snapshot index")
     save_figure(figure, output_dir / "gpu_resource_heatmap.png", dpi)
     plt.close(figure)
 
 
 def write_job_metrics(metrics: Dict[int, JobMetric], output_dir: Path) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
     with (output_dir / "job_metrics.csv").open("w", newline="", encoding="utf-8") as output:
         writer = csv.writer(output)
         writer.writerow(
@@ -528,13 +588,40 @@ def write_job_metrics(metrics: Dict[int, JobMetric], output_dir: Path) -> None:
             )
 
 
+def write_warmup_summary(output_dir: Path, warmup_ns: int, warmup_fraction: float,
+                         total_snapshots: int, plotted_snapshots: int,
+                         total_jobs: int, plotted_jobs: int) -> None:
+    with (output_dir / "warmup_summary.csv").open("w", newline="", encoding="utf-8") as output:
+        writer = csv.writer(output)
+        writer.writerow(["warmup_end_ns", "warmup_fraction", "total_snapshots",
+                         "post_warmup_snapshots", "total_jobs", "post_warmup_jobs"])
+        writer.writerow([warmup_ns, warmup_fraction, total_snapshots,
+                         plotted_snapshots, total_jobs, plotted_jobs])
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Plot SimAI multi-job scheduler metrics from a CSV log.")
     parser.add_argument("--log", type=Path, default=Path("SimAI_scheduler.csv"), help="scheduler CSV log")
     parser.add_argument("--output-dir", type=Path, default=Path("scheduler_plots"), help="directory for PNG files")
     parser.add_argument("--dpi", type=int, default=160)
+    parser.add_argument("--details", action="store_true",
+                        help="also generate job timeline, utilization, distributions and optional heatmap/bubbles")
+    parser.add_argument("--curve-bins", type=int, default=DEFAULT_CURVE_BINS,
+                        help="equal-time bins for resource trends; 0 shows raw states (default: 60)")
+    parser.add_argument("--max-latency-jobs", type=int, default=DEFAULT_MAX_LATENCY_JOBS,
+                        help="show this many slowest jobs in latency bars; CSV/histogram include all (default: 15)")
     parser.add_argument("--max-bubbles", type=int, default=120000,
                         help="maximum busy-GPU samples in the bubble chart")
+    parser.add_argument("--skip-bubbles", action="store_true",
+                        help="do not generate the resource allocation bubble plot")
+    parser.add_argument("--skip-heatmap", action="store_true",
+                        help="do not generate the GPU allocation heatmap")
+    parser.add_argument("--no-memory", action="store_true",
+                        help="omit memory panels and memory metrics from plots")
+    parser.add_argument("--warmup-fraction", type=float, default=None,
+                        help="optional plot start at this fraction of peak GPU occupancy")
+    parser.add_argument("--warmup-time-ns", type=int, default=None,
+                        help="explicit warmup end time in ns; overrides auto detection")
     parser.add_argument("--title", default="SimAI Scheduler", help="reserved chart title prefix")
     return parser.parse_args()
 
@@ -544,8 +631,17 @@ def main() -> int:
     if args.dpi <= 0:
         print("error: --dpi must be positive", file=sys.stderr)
         return 2
+    if args.curve_bins < 0 or args.max_latency_jobs <= 0:
+        print("error: --curve-bins must be nonnegative and --max-latency-jobs positive", file=sys.stderr)
+        return 2
     if args.max_bubbles <= 0:
         print("error: --max-bubbles must be positive", file=sys.stderr)
+        return 2
+    if args.warmup_fraction is not None and not 0 < args.warmup_fraction <= 1:
+        print("error: --warmup-fraction must be in (0, 1]", file=sys.stderr)
+        return 2
+    if args.warmup_time_ns is not None and args.warmup_time_ns < 0:
+        print("error: --warmup-time-ns cannot be negative", file=sys.stderr)
         return 2
     log_path = args.log.resolve()
     if not log_path.is_file():
@@ -556,26 +652,48 @@ def main() -> int:
         snapshots = load_snapshots(log_path)
         snapshots.sort(key=lambda snapshot: snapshot.time_ns)
         metrics = build_job_metrics(snapshots)
+        if args.warmup_time_ns is not None:
+            warmup_ns = args.warmup_time_ns
+        elif args.warmup_fraction is not None:
+            warmup_ns = detect_warmup_end(snapshots, args.warmup_fraction)
+        else:
+            warmup_ns = 0
+        plotted_snapshots = [snapshot for snapshot in snapshots
+                             if snapshot.time_ns >= warmup_ns]
+        if not plotted_snapshots:
+            raise RuntimeError("no scheduler snapshots remain after warmup")
+        plotted_metrics = post_warmup_jobs(metrics, warmup_ns)
         gpu_ids = sorted({gpu_id for snapshot in snapshots for gpu_id in snapshot.rows})
-        first_ns = snapshots[0].time_ns
-        last_ns = snapshots[-1].time_ns
+        first_ns = warmup_ns
+        last_ns = plotted_snapshots[-1].time_ns
         output_dir = args.output_dir.resolve()
         output_dir.mkdir(parents=True, exist_ok=True)
-        plot_gpu_schedule_timeline(plt, Patch, metrics, gpu_ids, first_ns, last_ns, output_dir, args.dpi)
-        plot_job_timeline(plt, Patch, metrics, first_ns, last_ns, output_dir, args.dpi)
-        plot_job_latencies(plt, metrics, output_dir, args.dpi)
-        plot_gpu_utilization(plt, snapshots, first_ns, last_ns, output_dir, args.dpi)
-        plot_gpu_resource_heatmap(plt, snapshots, gpu_ids, output_dir, args.dpi)
-        plot_resource_statistics(plt, snapshots, output_dir, args.dpi)
-        plot_resource_timeseries(plt, snapshots, first_ns, last_ns, output_dir, args.dpi)
-        plot_resource_bubbles(plt, snapshots, first_ns, last_ns, output_dir, args.dpi, args.max_bubbles)
-        write_resource_timeseries(snapshots, output_dir)
-        write_resource_summary(snapshots, output_dir)
+        plot_gpu_schedule_timeline(plt, Patch, plotted_metrics, gpu_ids, first_ns, last_ns, output_dir, args.dpi)
+        plot_job_latencies(plt, plotted_metrics, output_dir, args.dpi, args.max_latency_jobs)
+        plot_resource_timeseries(plt, plotted_snapshots, first_ns, last_ns, output_dir,
+                                 args.dpi, args.curve_bins)
+        if args.details:
+            plot_job_timeline(plt, Patch, plotted_metrics, first_ns, last_ns, output_dir, args.dpi)
+            plot_gpu_utilization(plt, plotted_snapshots, first_ns, last_ns, output_dir, args.dpi,
+                                 show_memory=not args.no_memory, curve_bins=args.curve_bins)
+            plot_resource_statistics(plt, plotted_snapshots, output_dir, args.dpi)
+        if args.details and not args.skip_heatmap:
+            plot_gpu_resource_heatmap(plt, plotted_snapshots, gpu_ids, output_dir, args.dpi,
+                                      show_memory=not args.no_memory)
+        if args.details and not args.skip_bubbles:
+            plot_resource_bubbles(plt, plotted_snapshots, first_ns, last_ns, output_dir, args.dpi, args.max_bubbles)
+        write_resource_timeseries(plotted_snapshots, output_dir)
+        write_resource_summary(plotted_snapshots, output_dir)
         write_job_metrics(metrics, output_dir)
+        write_job_metrics(plotted_metrics, output_dir / "post_warmup")
+        write_warmup_summary(output_dir, warmup_ns, args.warmup_fraction,
+                             len(snapshots), len(plotted_snapshots),
+                             len(metrics), len(plotted_metrics))
     except (OSError, RuntimeError, ValueError) as error:
         print("error: {}".format(error), file=sys.stderr)
         return 1
-    print("Wrote scheduler plots to {}".format(output_dir))
+    print("Wrote scheduler plots to {} (warmup_end_ns={})".format(
+        output_dir, warmup_ns))
     return 0
 
 

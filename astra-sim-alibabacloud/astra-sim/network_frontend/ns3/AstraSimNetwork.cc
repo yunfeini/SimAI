@@ -28,8 +28,11 @@
 #include <execinfo.h>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <memory>
+#include <mutex>
 #include <queue>
+#include <sstream>
 #include <stdio.h>
 #include <string>
 #include <thread>
@@ -69,9 +72,64 @@ static std::vector<ASTRASimNetwork*> g_job_networks;
 static std::unique_ptr<SimAiMultiJob::Scheduler> g_job_scheduler;
 static std::map<uint32_t, uint32_t> g_job_finished_ranks;
 static std::map<uint32_t, uint32_t> g_job_expected_ranks;
+static std::mutex g_job_completion_mutex;
 static uint32_t g_next_runtime_offset = 0;
+// Jobs are submitted through future ns-3 events.  A scheduler can therefore
+// be empty while there are still jobs that have not reached their submit time.
+// Keep the number of scheduled submit events so FinishScheduledJob does not
+// stop the simulator after the first early job completes.
+static uint32_t g_pending_submit_events = 0;
+static bool HasSplitTraceWorkload(const SimAiMultiJob::JobSpec& job) {
+  std::ifstream source(job.workload.c_str());
+  std::string header;
+  std::string count_line;
+  std::string line;
+  if (!std::getline(source, header) || !std::getline(source, count_line) ||
+      !std::getline(source, line) ||
+      line.compare(0, 15, "trace_job_part_") != 0) {
+    return false;
+  }
+  const auto invalid = [&job]() {
+    return std::runtime_error("invalid split trace workload or communication total: " +
+                              job.workload);
+  };
+  uint64_t count = 0;
+  std::istringstream count_input(count_line);
+  if (!(count_input >> count) || count < 2 ||
+      count > static_cast<uint64_t>(std::numeric_limits<int>::max())) {
+    throw invalid();
+  }
+  uint64_t total = 0;
+  for (uint64_t index = 0; index < count; ++index) {
+    if (index > 0 && !std::getline(source, line)) throw invalid();
+    std::istringstream input(line);
+    std::string name, forward, input_grad, weight_grad, extra;
+    int dependency;
+    uint64_t forward_compute, bytes, input_compute, input_bytes;
+    uint64_t weight_compute, weight_bytes, update;
+    if (!(input >> name >> dependency >> forward_compute >> forward >> bytes >>
+          input_compute >> input_grad >> input_bytes >> weight_compute >>
+          weight_grad >> weight_bytes >> update) ||
+        name != "trace_job_part_" + std::to_string(index) ||
+        forward != "ALLREDUCE" || bytes == 0 ||
+        input_grad != "NONE" || input_bytes != 0 ||
+        weight_grad != "NONE" || weight_bytes != 0 || (input >> extra) ||
+        bytes > job.communication_bytes - total) {
+      throw invalid();
+    }
+    total += bytes;
+  }
+  while (std::getline(source, line)) {
+    if (line.find_first_not_of(" \t\r") != std::string::npos) throw invalid();
+  }
+  if (total != job.communication_bytes) throw invalid();
+  return true;
+}
 static std::string BuildTraceWorkload(const SimAiMultiJob::JobSpec& job) {
   if (job.communication_bytes == 0) return job.workload;
+  // The trace adapter materializes bounded collectives even for the compact
+  // CSV. Preserve them while retaining the total bytes for Crux priorities.
+  if (HasSplitTraceWorkload(job)) return job.workload;
   const std::string directory = "./results/trace_workloads";
   const std::string path = directory + "/job_" +
                            std::to_string(job.job_id) + ".txt";
@@ -109,19 +167,23 @@ static std::string JobResultPath(const SimAiMultiJob::JobSpec& job) {
   return path;
 }
 static void FinishScheduledJob(uint32_t job_id) {
+  std::lock_guard<std::recursive_mutex> callback_lock(astra_callback_mutex);
   if (g_job_scheduler) {
     g_job_scheduler->Finish(job_id, Simulator::Now().GetNanoSeconds());
-    if (g_job_scheduler->Empty()) {
+    if (g_pending_submit_events == 0 && g_job_scheduler->Empty()) {
       Simulator::Stop();
     }
   }
 }
 static void SubmitScheduledJob(SimAiMultiJob::JobSpec job) {
+  std::lock_guard<std::recursive_mutex> callback_lock(astra_callback_mutex);
+  if (g_pending_submit_events > 0) {
+    --g_pending_submit_events;
+  }
   if (g_job_scheduler) {
     g_job_scheduler->Submit(job, Simulator::Now().GetNanoSeconds());
   }
 }
-
 class ASTRASimNetwork : public AstraSim::AstraNetworkAPI {
 private:
   int runtime_offset;
@@ -195,12 +257,10 @@ public:
   }
   virtual void sim_schedule(AstraSim::timespec_t delta,
                             void (*fun_ptr)(void *fun_arg), void *fun_arg) {
-    task1 t;
-    t.type = 2;
-    t.fun_arg = fun_arg;
-    t.msg_handler = fun_ptr;
-    t.schTime = delta.time_val;
-    Simulator::Schedule(NanoSeconds(t.schTime), t.msg_handler, t.fun_arg);
+    ScheduledAstraCallback* callback = new ScheduledAstraCallback{
+        fun_ptr, fun_arg};
+    Simulator::Schedule(NanoSeconds(delta.time_val),
+                        &dispatch_astra_callback, callback);
     return;
   }
   virtual int sim_send(void *buffer,   
@@ -221,7 +281,7 @@ public:
     t.msg_handler = msg_handler;
     {
       #ifdef NS3_MTP
-      MtpInterface::explicitCriticalSection cs;
+      EntryCriticalSection cs;
       #endif
       sentHash[make_flow_key(request->flowTag, t.src, t.dest)] = t;
       #ifdef NS3_MTP
@@ -235,7 +295,7 @@ public:
                        AstraSim::sim_request *request,
                        void (*msg_handler)(void *fun_arg), void *fun_arg) {
     #ifdef NS3_MTP
-    MtpInterface::explicitCriticalSection cs;
+    EntryCriticalSection cs;
     #endif
     MockNcclLog* NcclLog = MockNcclLog::getInstance();
     AstraSim::ncclFlowTag flowTag = request->flowTag;
@@ -268,7 +328,7 @@ public:
         #ifdef NS3_MTP
         cs.ExitSection();
         #endif
-        t.msg_handler(t.fun_arg);
+        invoke_astra_callback(t.msg_handler, t.fun_arg);
         goto sim_recv_end_section;
       } else if (count > t.count) {
         recvHash[key] = count - t.count;
@@ -281,7 +341,7 @@ public:
         #ifdef NS3_MTP
         cs.ExitSection();
         #endif
-        t.msg_handler(t.fun_arg);
+        invoke_astra_callback(t.msg_handler, t.fun_arg);
         goto sim_recv_end_section;
       } else {
         recvHash.erase(key);
@@ -310,6 +370,21 @@ sim_recv_end_section:
   void handleEvent(int dst, int cnt) {
   }
 };
+
+static void CleanupAllJobsAfterSimulatorDestroy() {
+  // Do not destroy Sys objects from a workload completion callback: ns-3 may
+  // still have packet/callback events carrying those pointers.  At this
+  // point Simulator::Destroy() has removed the event queue, so ownership can
+  // be released safely in one pass.
+  for (AstraSim::Sys*& system : g_job_systems) {
+    delete system;
+    system = nullptr;
+  }
+  for (ASTRASimNetwork*& network : g_job_networks) {
+    delete network;
+    network = nullptr;
+  }
+}
 
 static void StartJob(const SimAiMultiJob::JobSpec& job,
                      const SimAiMultiJob::Placement& placement) {
@@ -355,25 +430,39 @@ static void StartJob(const SimAiMultiJob::JobSpec& job,
                                                   logical_switches.size()));
     }
   }
-  const bool placement_spans_partial_servers =
-      placement.num_gpus % gpus_per_job_node != 0 ||
-      physical_switches.size() > 1;
+  // Keep complete physical servers as separate logical nodes.  Only a job
+  // that occupies a partial server needs the one-logical-node compatibility
+  // layout; collapsing a multi-server job (for example [8..15, 32..39])
+  // changes the collective rank grouping and can leave nonzero ranks waiting
+  // forever for an AllReduce peer.
+  const bool fragmented_layout = placement.num_gpus % gpus_per_job_node != 0;
+  const int logical_ranks_per_node = fragmented_layout
+                                         ? static_cast<int>(placement.num_gpus)
+                                         : static_cast<int>(gpus_per_job_node);
+  if (fragmented_layout) {
+    // MockNCCL builds one logical group per job. Represent a fragmented
+    // physical placement as one logical node; ns-3 still routes each local
+    // rank through its explicit physical GPU map above.
+    logical_switches.assign(1, static_cast<int>(placement.num_gpus));
+  }
+  const bool placement_spans_partial_servers = fragmented_layout;
 
   g_job_expected_ranks[job.job_id] = placement.num_gpus;
   g_job_finished_ranks[job.job_id] = 0;
   const uint32_t runtime_offset = g_next_runtime_offset;
   g_next_runtime_offset += placement.num_gpus;
-  if (g_job_systems.size() < runtime_offset + placement.num_gpus) {
-    g_job_systems.resize(runtime_offset + placement.num_gpus, nullptr);
-    g_job_networks.resize(runtime_offset + placement.num_gpus, nullptr);
+  if (runtime_offset + placement.num_gpus > g_job_systems.size() ||
+      runtime_offset + placement.num_gpus > g_job_networks.size() ||
+      runtime_offset + placement.num_gpus > AstraSim::Sys::all_generators.size()) {
+    throw std::runtime_error("preallocated runtime-rank table is too small");
   }
+  const std::string workload_path = BuildTraceWorkload(job);
   for (uint32_t local = 0; local < placement.num_gpus; ++local) {
     const uint32_t runtime_rank = runtime_offset + local;
     std::vector<int> local_gpu_map = physical_gpus;
     std::vector<int> local_switch_map = physical_switches;
     g_job_networks[runtime_rank] = new ASTRASimNetwork(
         local, runtime_offset, local_gpu_map, local_switch_map);
-    const std::string workload_path = BuildTraceWorkload(job);
     const bool trace_job = job.name.compare(0, 6, "trace-") == 0 ||
                            job.workload.find("cluster-trace") != std::string::npos;
     const std::string result_path = trace_job ? JobResultPath(job) : RESULT_PATH;
@@ -382,7 +471,7 @@ static void StartJob(const SimAiMultiJob::JobSpec& job,
         {static_cast<int>(placement.num_gpus)}, {1}, "", workload_path, 1, 1,
         1, 1, 0, result_path, job.name, true, false, gpu_type,
         {static_cast<int>(placement.num_gpus)}, logical_switches,
-        gpus_per_job_node, job.job_id);
+        logical_ranks_per_node, job.job_id);
     if (g_job_systems[runtime_rank]->workload == nullptr ||
         g_job_systems[runtime_rank]->workload->all_gpus !=
             static_cast<int>(placement.num_gpus)) {
@@ -396,21 +485,36 @@ static void StartJob(const SimAiMultiJob::JobSpec& job,
       // generic ring/tree network path; NVLS needs a per-rank switch map.
       g_job_systems[runtime_rank]->NVSwitchs.clear();
     }
-    const int physical_switch = NVswitchs[rank_server[local]];
-    const auto switch_it = std::find(physical_switches.begin(),
-                                     physical_switches.end(), physical_switch);
-    g_job_systems[runtime_rank]->nvswitch_id = logical_switches[
-        static_cast<size_t>(switch_it - physical_switches.begin())];
+    if (fragmented_layout) {
+      g_job_systems[runtime_rank]->nvswitch_id = logical_switches.front();
+    } else {
+      const int physical_switch = NVswitchs[rank_server[local]];
+      const auto switch_it = std::find(physical_switches.begin(),
+                                       physical_switches.end(), physical_switch);
+      g_job_systems[runtime_rank]->nvswitch_id = logical_switches[
+          static_cast<size_t>(switch_it - physical_switches.begin())];
+    }
     g_job_systems[runtime_rank]->workload_finished_callback =
         [](uint32_t finished_job_id) {
-          uint32_t& finished = g_job_finished_ranks[finished_job_id];
-          if (++finished == g_job_expected_ranks[finished_job_id] &&
-              g_job_scheduler) {
+          bool all_ranks_finished = false;
+          {
+            std::lock_guard<std::mutex> lock(g_job_completion_mutex);
+            auto expected = g_job_expected_ranks.find(finished_job_id);
+            if (expected != g_job_expected_ranks.end()) {
+              uint32_t& finished = g_job_finished_ranks[finished_job_id];
+              all_ranks_finished = ++finished == expected->second;
+            }
+          }
+          if (all_ranks_finished && g_job_scheduler) {
             Simulator::Schedule(NanoSeconds(1), &FinishScheduledJob,
                                 finished_job_id);
           }
         };
-    g_job_systems[runtime_rank]->workload->fire();
+  }
+  // Do not let MTP process a rank's collective while peer Sys objects and
+  // communicators for this job are still being constructed.
+  for (uint32_t local = 0; local < placement.num_gpus; ++local) {
+    g_job_systems[runtime_offset + local]->workload->fire();
   }
 }
 
@@ -526,8 +630,18 @@ int main(int argc, char *argv[]) {
                                    " GPU count exceeds the simulated GPU capacity");
         }
       }
-      g_job_systems.assign(gpu_num, nullptr);
-      g_job_networks.assign(gpu_num, nullptr);
+      size_t total_runtime_ranks = 0;
+      for (const auto& job : jobs) {
+        if (job.num_gpus >
+            std::numeric_limits<size_t>::max() - total_runtime_ranks) {
+          throw std::runtime_error("total job rank count exceeds addressable memory");
+        }
+        total_runtime_ranks += job.num_gpus;
+      }
+      g_job_systems.assign(total_runtime_ranks, nullptr);
+      g_job_networks.assign(total_runtime_ranks, nullptr);
+      AstraSim::Sys::all_generators.assign(
+          total_runtime_ranks, nullptr);
       std::vector<SimAiMultiJob::GpuResource> resources(gpu_num);
       for (auto& resource : resources) {
         resource.gpu_memory_capacity_bytes = user_param.gpu_memory_capacity;
@@ -544,14 +658,30 @@ int main(int argc, char *argv[]) {
       g_job_scheduler->SetLogFile(user_param.scheduler_log_file);
       AstraSim::Sys::SetMultiJobMode(true);
       g_job_scheduler->SetStartCallback(StartJob);
+      g_pending_submit_events = static_cast<uint32_t>(jobs.size());
       for (const auto& job : jobs) {
         Simulator::Schedule(NanoSeconds(job.submit_time_ns),
                             &SubmitScheduledJob, job);
       }
-      Simulator::Stop(Seconds(simulator_stop_time));
+      uint64_t latest_submit_ns = 0;
+      for (const auto& job : jobs) {
+        latest_submit_ns = std::max(latest_submit_ns, job.submit_time_ns);
+      }
+      // SIMULATOR_STOP_TIME is expressed in seconds.  Treat it as a guard
+      // interval and extend the multi-job horizon past the last arrival, so
+      // a trace with late submit timestamps cannot be truncated.  The
+      // completion callback still stops the run as soon as every job really
+      // finishes.
+      const double latest_submit_seconds =
+          static_cast<double>(latest_submit_ns) / 1e9;
+      const double guard_seconds = std::max(simulator_stop_time, 1.0);
+      const double multi_job_stop_time = std::max(
+          simulator_stop_time, latest_submit_seconds + guard_seconds);
+      Simulator::Stop(Seconds(multi_job_stop_time));
       std::cout << "Running " << jobs.size() << " scheduled SimAI workloads.\n";
       Simulator::Run();
       Simulator::Destroy();
+      CleanupAllJobsAfterSimulatorDestroy();
       #ifdef NS3_MPI
       MpiInterface::Disable();
       #endif

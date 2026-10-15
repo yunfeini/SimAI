@@ -10,8 +10,39 @@ import argparse
 import csv
 import json
 import math
+import random
 import sys
 from pathlib import Path
+
+
+DEFAULT_MAX_ALLREDUCE_BYTES = 1024 * 1024
+# With the current 9000-byte MTU, a Ring flow of at most 8192 bytes fits
+# inside a single packet including its headers. Ring divides each collective
+# by ranks and channels; assuming one channel is the conservative bound.
+MAX_RING_FLOW_BYTES = 8192
+MIN_RUNTIME_ALLREDUCE_BYTES = 4096
+
+
+def allreduce_limit(gpu_count: int, max_allreduce_bytes: int) -> int:
+    if gpu_count <= 0:
+        raise ValueError("GPU count must be positive")
+    if max_allreduce_bytes < 2 * MIN_RUNTIME_ALLREDUCE_BYTES:
+        raise ValueError("--max-allreduce-bytes must be at least 8192")
+    return min(max_allreduce_bytes, gpu_count * MAX_RING_FLOW_BYTES)
+
+
+def split_communication(communication: int, gpu_count: int,
+                        max_allreduce_bytes: int = DEFAULT_MAX_ALLREDUCE_BYTES):
+    """Yield bounded collective sizes without changing the total byte count."""
+    if communication <= 0:
+        raise ValueError("communication must be positive")
+    limit = allreduce_limit(gpu_count, max_allreduce_bytes)
+    count = (communication + limit - 1) // limit
+    size, larger_parts = divmod(communication, count)
+    # Balance all parts, rather than emitting a small remainder that the
+    # frontend would silently raise to its 4096-byte minimum.
+    for index in range(count):
+        yield size + (index < larger_parts)
 
 
 def positive_float(value: str) -> float:
@@ -26,27 +57,35 @@ def load_node_count(path: Path) -> int:
         return sum(1 for _ in csv.DictReader(source))
 
 
-def trace_workload_path(root: Path, output_dir: Path, gpu_count: int) -> str:
-    # The ns-3 frontend creates the duration-specific workload at job start.
-    # This compact placeholder is retained in the manifest for compatibility.
-    path = (output_dir / "workloads" /
-            "trace_workload_{}gpu.txt".format(gpu_count)).resolve()
+def trace_workload_path(root: Path, path: Path) -> str:
+    path = path.resolve()
     try:
         return "./" + str(path.relative_to(root.resolve()))
     except ValueError:
         return str(path)
 
 
-def write_workload(path: Path, gpu_count: int, communication: int) -> None:
-    path.write_text(
-        "HYBRID_TRANSFORMER_FWD_IN_BCKWD "
-        "model_parallel_NPU_group: {0} ep: 1 pp: 1 vpp: 1 ga: 1 all_gpus: {0} "
-        "checkpoints: 0 checkpoint_initiates: 0 pp_comm: 0\n"
-        "1\ntrace_job -1 1 ALLREDUCE {1} 1 NONE 0 1 NONE 0 1\n".format(
-            gpu_count, communication
-        ),
-        encoding="utf-8",
-    )
+def write_workload(path: Path, gpu_count: int, communication: int,
+                   max_allreduce_bytes: int = DEFAULT_MAX_ALLREDUCE_BYTES) -> int:
+    limit = allreduce_limit(gpu_count, max_allreduce_bytes)
+    count = (communication + limit - 1) // limit
+    if communication <= 0:
+        raise ValueError("communication must be positive")
+    with path.open("w", encoding="utf-8") as output:
+        output.write(
+            "HYBRID_TRANSFORMER_FWD_IN_BCKWD "
+            "model_parallel_NPU_group: {0} ep: 1 pp: 1 vpp: 1 ga: 1 all_gpus: {0} "
+            "checkpoints: 0 checkpoint_initiates: 0 pp_comm: 0\n{1}\n".format(
+                gpu_count, count
+            )
+        )
+        for index, amount in enumerate(split_communication(
+                communication, gpu_count, max_allreduce_bytes)):
+            name = "trace_job" if count == 1 else "trace_job_part_{}".format(index)
+            output.write(
+                "{} -1 1 ALLREDUCE {} 1 NONE 0 1 NONE 0 1\n".format(name, amount)
+            )
+    return count
 
 
 def main() -> int:
@@ -68,20 +107,27 @@ def main() -> int:
                         help="multiply trace submit seconds before converting to ns")
     parser.add_argument("--duration-scale", type=positive_float, default=1.0,
                         help="multiply duration before writing communication amount")
+    parser.add_argument("--max-allreduce-bytes", type=int,
+                        default=DEFAULT_MAX_ALLREDUCE_BYTES,
+                        help="maximum bytes per ALLREDUCE (default: 1048576; "
+                             "also capped at 8192 * job GPUs for the 9000-byte MTU)")
     parser.add_argument("--max-jobs", type=int, default=0,
-                        help="0 keeps all jobs")
+                        help="randomly select up to this many input jobs; 0 keeps all")
     parser.add_argument("--overflow-policy", choices=("drop", "error"), default="drop",
                         help="handling for jobs requiring more than --total-gpus")
     parser.add_argument("--keep-trace-start", action="store_true",
                         help="do not normalize the first trace submit time to zero")
     parser.add_argument("--compact-csv", action="store_true",
-                        help="use the 8-column CSV; requires a rebuilt SimAI binary")
+                        help="use the 8-column CSV with total communication bytes; "
+                             "requires a rebuilt SimAI binary to preserve split workloads")
     args = parser.parse_args()
 
     if args.total_gpus <= 0 or args.gpu_capacity_num <= 0:
         parser.error("--total-gpus and --gpu-capacity-num must be positive")
     if args.max_jobs < 0:
         parser.error("--max-jobs cannot be negative")
+    if args.max_allreduce_bytes < 2 * MIN_RUNTIME_ALLREDUCE_BYTES:
+        parser.error("--max-allreduce-bytes must be at least 8192")
     trace_dir = args.trace_dir.resolve()
     jobs_file = (args.jobs_file or trace_dir / "job_info_df.csv").resolve()
     nodes_file = (args.nodes_file or trace_dir / "node_info_df.csv").resolve()
@@ -93,7 +139,7 @@ def main() -> int:
 
     trace_node_count = load_node_count(nodes_file)
     output_dir.mkdir(parents=True, exist_ok=True)
-    placeholders = {}
+    workloads = {}
     rows = []
     skipped = 0
     first_submit = None
@@ -103,15 +149,27 @@ def main() -> int:
         missing = required - set(reader.fieldnames or [])
         if missing:
             parser.error("job trace misses fields: " + ", ".join(sorted(missing)))
+        selected_row_indices = None
+        if args.max_jobs:
+            total_jobs = sum(1 for _ in reader)
+            if args.max_jobs < total_jobs:
+                selected_row_indices = set(
+                    random.sample(range(1, total_jobs + 1), args.max_jobs)
+                )
+            source.seek(0)
+            reader = csv.DictReader(source)
         for row_index, row in enumerate(reader, start=1):
-            if args.max_jobs and len(rows) >= args.max_jobs:
-                break
+            if selected_row_indices is not None and row_index not in selected_row_indices:
+                continue
             try:
                 requested = float(row["gpu_request"])
                 workers = float(row["worker_num"])
-                submit_seconds = float(row["submit_time"])
-                duration = float(row["duration"])
-                requested_gpus = int(math.ceil(requested * workers))
+                submit_seconds = float(row["submit_time"])/1e10
+                requested_gpus = int(2*math.ceil(requested))
+                # The trace duration is intentionally used as the simulated
+                # communication amount.  Do not normalize it by GPU count or
+                # an arbitrary byte scale: that made all values round to 1.
+                duration = float(row["duration"])/requested_gpus
                 # gpu_capacity_num describes node capacity only; it must not
                 # round a job request to a multiple of eight GPUs.
                 gpu_count = requested_gpus
@@ -135,21 +193,13 @@ def main() -> int:
             relative_submit = submit_seconds if args.keep_trace_start else submit_seconds - first_submit
             submit_ns = max(0, int(round(relative_submit * args.arrival_scale * 1_000_000_000)))
             job_id = len(rows) + 1
-            workload = trace_workload_path(root, output_dir, gpu_count)
-            if not args.compact_csv:
-                workload_path = output_dir / "workloads" / (
-                    "job_{}_{}gpu.txt".format(len(rows) + 1, gpu_count)
-                )
-                workload = trace_workload_path(root, output_dir, gpu_count)
-                try:
-                    workload = "./" + str(workload_path.resolve().relative_to(root.resolve()))
-                except ValueError:
-                    workload = str(workload_path.resolve())
-                placeholders[workload_path] = (gpu_count, communication)
-            else:
-                placeholders.setdefault(output_dir / "workloads" /
-                                        ("trace_workload_{}gpu.txt".format(gpu_count)),
-                                        (gpu_count, communication))
+            # Every job needs its own workload even in the 8-column manifest:
+            # jobs with equal GPU counts can have different collective splits.
+            workload_path = output_dir / "workloads" / (
+                "job_{}_{}gpu.txt".format(job_id, gpu_count)
+            )
+            workload = trace_workload_path(root, workload_path)
+            workloads[workload_path] = (gpu_count, communication)
             job_row = {
                 "job_id": job_id,
                 "workload": workload,
@@ -174,11 +224,16 @@ def main() -> int:
         writer.writeheader()
         writer.writerows(rows)
 
-    placeholder_dir = output_dir / "workloads"
-    placeholder_dir.mkdir(parents=True, exist_ok=True)
-    for workload_path, (gpu_count, communication) in placeholders.items():
+    collective_count = 0
+    split_jobs = 0
+    communication_total = 0
+    for workload_path, (gpu_count, communication) in workloads.items():
         workload_path.parent.mkdir(parents=True, exist_ok=True)
-        write_workload(workload_path, gpu_count, communication)
+        count = write_workload(workload_path, gpu_count, communication,
+                               args.max_allreduce_bytes)
+        collective_count += count
+        split_jobs += count > 1
+        communication_total += communication
     summary = {
         "source_jobs_file": str(jobs_file),
         "source_nodes_file": str(nodes_file),
@@ -191,6 +246,12 @@ def main() -> int:
         "jobs_skipped": skipped,
         "arrival_scale": args.arrival_scale,
         "duration_scale": args.duration_scale,
+        "max_allreduce_bytes": args.max_allreduce_bytes,
+        "max_ring_flow_bytes": MAX_RING_FLOW_BYTES,
+        "allreduce_limit_rule": "min(max_allreduce_bytes, 8192 * job GPUs)",
+        "jobs_with_split_allreduces": split_jobs,
+        "allreduce_count": collective_count,
+        "total_workload_communication_bytes": communication_total,
         "policy": "fcfs",
         "cpu_modeled": False,
     }
@@ -199,6 +260,9 @@ def main() -> int:
     )
     print("Wrote {} jobs to {}".format(len(rows), output_csv))
     print("Skipped {} jobs above/without topology capacity {}".format(skipped, args.total_gpus))
+    print("Wrote {} ALLREDUCE operations; {} jobs split; total communication {} bytes".format(
+        collective_count, split_jobs, communication_total
+    ))
     print("Trace nodes: {}, fixed GPUs/node: {}, trace GPU capacity: {}".format(
         trace_node_count, args.gpu_capacity_num, trace_node_count * args.gpu_capacity_num
     ))

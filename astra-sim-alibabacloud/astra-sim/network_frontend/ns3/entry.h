@@ -20,6 +20,7 @@
 #define PATH_TO_PGO_CONFIG "path_to_pgo_config"
 #define _QPS_PER_CONNECTION_  1
 #include "common.h"
+#include "RdmaFlowRegistry.h"
 #include "ns3/applications-module.h"
 #include "ns3/core-module.h"
 #include "ns3/error-model.h"
@@ -31,6 +32,7 @@
 #include "ns3/qbb-helper.h"
 #include <fstream>
 #include <iostream>
+#include <memory>
 #include <ns3/rdma-client-helper.h>
 #include <ns3/rdma-client.h>
 #include <ns3/rdma-driver.h>
@@ -40,6 +42,7 @@
 #include <time.h>
 #include <unordered_map>
 #include <mutex>
+#include <stdexcept>
 #include <vector>
 #ifdef NS3_MTP
 #include "ns3/mtp-interface.h"
@@ -53,11 +56,30 @@ using namespace std;
 
 
 using FlowKey = std::tuple<uint32_t, int, int, int>;
-using PortKey = std::tuple<uint32_t, int, int, uint16_t>;
+#ifdef NS3_MTP
+using EntryCriticalSection =
+    SimAiNs3::ScopedCriticalSection<MtpInterface::explicitCriticalSection>;
+#endif
+static std::recursive_mutex astra_callback_mutex;
+inline void invoke_astra_callback(void (*handler)(void*), void* arg) {
+#ifdef NS3_MTP
+  std::lock_guard<std::recursive_mutex> lock(astra_callback_mutex);
+#endif
+  handler(arg);
+}
+struct ScheduledAstraCallback {
+  void (*handler)(void*);
+  void* arg;
+};
+inline void dispatch_astra_callback(void* arg) {
+  std::unique_ptr<ScheduledAstraCallback> callback(
+      static_cast<ScheduledAstraCallback*>(arg));
+  invoke_astra_callback(callback->handler, callback->arg);
+}
 std::map<FlowKey, AstraSim::ncclFlowTag> receiver_pending_queue;
 
 
-std::map<PortKey, AstraSim::ncclFlowTag> sender_src_port_map;
+SimAiNs3::RdmaFlowRegistry<AstraSim::ncclFlowTag> sender_src_port_map;
 struct task1 {
   int src;
   int dest;
@@ -77,20 +99,6 @@ map<FlowKey,uint64_t>received_chunksize;
 map<FlowKey,uint64_t>sent_chunksize;
 inline FlowKey make_flow_key(const AstraSim::ncclFlowTag& tag, int src, int dst) {
   return std::make_tuple(tag.job_id, tag.tag_id, src, dst);
-}
-inline PortKey make_port_key(const AstraSim::ncclFlowTag& tag, int src, int dst,
-                             uint16_t port) {
-  return std::make_tuple(tag.job_id, src, dst, port);
-}
-inline std::map<PortKey, AstraSim::ncclFlowTag>::iterator find_port_tag(
-    int src, int dst, uint16_t port) {
-  for (auto it = sender_src_port_map.begin(); it != sender_src_port_map.end(); ++it) {
-    if (std::get<1>(it->first) == src && std::get<2>(it->first) == dst &&
-        std::get<3>(it->first) == port) {
-      return it;
-    }
-  }
-  return sender_src_port_map.end();
 }
 bool is_sending_finished(int src,int dst,AstraSim::ncclFlowTag flowTag){
   FlowKey key = make_flow_key(flowTag, src, dst);
@@ -124,16 +132,20 @@ void SendFlow(int src, int dst, uint64_t maxPacketCount,
   for(int index = 0 ;index<_QPS_PER_CONNECTION_;index++){
   uint64_t real_PacketCount = min(PacketCount,leftPacketCount);
   leftPacketCount-=real_PacketCount;
-  uint32_t port = portNumber[src][dst]++; 
-    {
-      #ifdef NS3_MTP
-      MtpInterface::explicitCriticalSection cs;
-      #endif
-      sender_src_port_map[make_port_key(request->flowTag, src, dst, port)] = request->flowTag;
-      #ifdef NS3_MTP
-      cs.ExitSection();
-      #endif
-    }
+  uint16_t port = 0;
+  {
+    #ifdef NS3_MTP
+    EntryCriticalSection cs;
+    #endif
+    // Allocate and register atomically. After the 16-bit counter wraps, skip
+    // any port still used by a live flow instead of replacing another job's tag.
+    port = sender_src_port_map.AllocatePort(
+        src, dst, portNumber[src][dst], request->flowTag);
+    flow_input.idx++;
+    #ifdef NS3_MTP
+    cs.ExitSection();
+    #endif
+  }
   int flow_id = request->flowTag.current_flow_id;
   bool nvls_on = request->flowTag.nvls_on;
   int pg = 3, dport = 100;
@@ -188,7 +200,6 @@ void SendFlow(int src, int dst, uint64_t maxPacketCount,
     }
   }
   send_lat *= 1000; // ns → ps (ns3 Time unit)
-  flow_input.idx++;
   if(real_PacketCount == 0) real_PacketCount = 1;
     MockNcclLog* NcclLog = MockNcclLog::getInstance();
     NcclLog->writeLog(NcclLogLevel::DEBUG," [Packet sending event]  %dSendFlow to  %d channelid:  %d flow_id  %d srcip  %d dstip  %d size:  %llu at the tick:  %d",src,dst,tag,flow_id,serverAddress[src],serverAddress[dst],maxPacketCount,AstraSim::Sys::boostedTick());
@@ -202,7 +213,7 @@ void SendFlow(int src, int dst, uint64_t maxPacketCount,
   FlowKey key = make_flow_key(request->flowTag, src, dst);
   {
     #ifdef NS3_MTP
-    MtpInterface::explicitCriticalSection cs;
+    EntryCriticalSection cs;
     #endif
     ApplicationContainer appCon = clientHelper.Install(n.Get(src));
     appCon.Start(Time(send_lat));
@@ -220,7 +231,7 @@ void notify_receiver_receive_data(int sender_node, int receiver_node,
                                   uint64_t message_size, AstraSim::ncclFlowTag flowTag) {
   {
     #ifdef NS3_MTP
-    MtpInterface::explicitCriticalSection cs;   
+    EntryCriticalSection cs;
     #endif                         
     MockNcclLog* NcclLog = MockNcclLog::getInstance();
     NcclLog->writeLog(NcclLogLevel::DEBUG," %d notify recevier:  %d message size:  %llu",sender_node,receiver_node,message_size);
@@ -239,7 +250,7 @@ void notify_receiver_receive_data(int sender_node, int receiver_node,
         #endif
         assert(ehd->flowTag.current_flow_id == -1 && ehd->flowTag.child_flow_id == -1);
         ehd->flowTag = flowTag;
-        t2.msg_handler(t2.fun_arg);
+        invoke_astra_callback(t2.msg_handler, t2.fun_arg);
         goto receiver_end_1st_section;
       } else if (message_size > t2.count) {
         recvHash[key] = message_size - t2.count;
@@ -250,7 +261,7 @@ void notify_receiver_receive_data(int sender_node, int receiver_node,
         #endif
         assert(ehd->flowTag.current_flow_id == -1 && ehd->flowTag.child_flow_id == -1);
         ehd->flowTag = flowTag;
-        t2.msg_handler(t2.fun_arg);
+        invoke_astra_callback(t2.msg_handler, t2.fun_arg);
         goto receiver_end_1st_section;
       } else {
         t2.count -= message_size;
@@ -270,7 +281,7 @@ void notify_receiver_receive_data(int sender_node, int receiver_node,
   receiver_end_1st_section:
     {
     #ifdef NS3_MTP
-    MtpInterface::explicitCriticalSection cs2;
+    EntryCriticalSection cs2;
     #endif  
     if (nodeHash.find(make_pair(receiver_node, 1)) == nodeHash.end()) {
       nodeHash[make_pair(receiver_node, 1)] = message_size;
@@ -289,7 +300,7 @@ void notify_sender_sending_finished(int sender_node, int receiver_node,
   { 
     MockNcclLog * NcclLog = MockNcclLog::getInstance();
     #ifdef NS3_MTP
-    MtpInterface::explicitCriticalSection cs;
+    EntryCriticalSection cs;
     #endif    
     int tag = flowTag.tag_id;
     FlowKey key = make_flow_key(flowTag, sender_node, receiver_node);
@@ -307,7 +318,7 @@ void notify_sender_sending_finished(int sender_node, int receiver_node,
         #ifdef NS3_MTP
         cs.ExitSection();
         #endif
-        t2.msg_handler(t2.fun_arg);
+        invoke_astra_callback(t2.msg_handler, t2.fun_arg);
         goto sender_end_1st_section;
       }else{
         NcclLog->writeLog(NcclLogLevel::ERROR,"sentHash msg size != sender_node %d receiver_node %d message_size %lu flow_id ",sender_node,receiver_node,message_size);
@@ -338,7 +349,7 @@ void notify_sender_packet_arrivered_receiver(int sender_node, int receiver_node,
       } else {
         nodeHash[make_pair(sender_node, 0)] += message_size;
       }
-      t2.msg_handler(t2.fun_arg);
+      invoke_astra_callback(t2.msg_handler, t2.fun_arg);
     }
   }
 }
@@ -361,19 +372,23 @@ void qp_finish(FILE *fout, Ptr<RdmaQueuePair> q) {
   uint64_t notify_size;
   {
     #ifdef NS3_MTP
-    MtpInterface::explicitCriticalSection cs;
+    EntryCriticalSection cs;
     #endif
+    MockNcclLog* NcclLog = MockNcclLog::getInstance();
+    NcclLog->writeLog(NcclLogLevel::DEBUG,"qp finish, src:  %d did:  %d port:  %d total bytes:  %llu at the tick:  %d",sid,did,q->sport,q->m_size,AstraSim::Sys::boostedTick());
+    const auto completion = sender_src_port_map.Complete(
+        sid, did, q->sport, SimAiNs3::CompletionSide::Receive, flowTag);
+    if (completion != SimAiNs3::CompletionStatus::Recorded) {
+      NcclLog->writeLog(completion == SimAiNs3::CompletionStatus::Missing
+                           ? NcclLogLevel::WARNING : NcclLogLevel::DEBUG,
+          "ignored %s RDMA receive completion src %u dst %u port %u",
+          completion == SimAiNs3::CompletionStatus::Missing ? "missing" : "duplicate",
+          sid, did, static_cast<unsigned>(q->sport));
+      return;
+    }
     Ptr<Node> dstNode = n.Get(did);
     Ptr<RdmaDriver> rdma = dstNode->GetObject<RdmaDriver>();
     rdma->m_rdma->DeleteRxQp(q->sip.Get(), q->m_pg, q->sport);
-    MockNcclLog* NcclLog = MockNcclLog::getInstance();
-    NcclLog->writeLog(NcclLogLevel::DEBUG,"qp finish, src:  %d did:  %d port:  %d total bytes:  %llu at the tick:  %d",sid,did,q->sport,q->m_size,AstraSim::Sys::boostedTick());
-    auto port_it = find_port_tag(sid, did, q->sport);
-    if (port_it == sender_src_port_map.end()) {
-      NcclLog->writeLog(NcclLogLevel::ERROR,"could not find the tag, there must be something wrong");
-      exit(-1);
-    }
-    flowTag = port_it->second;
     FlowKey key = make_flow_key(flowTag, sid, did);
     received_chunksize[key] += q->m_size;
     if(!is_receive_finished(sid,did,flowTag)) {
@@ -399,11 +414,18 @@ void send_finish(FILE *fout, Ptr<RdmaQueuePair> q) {
   uint64_t all_sent_chunksize;
   {
     #ifdef NS3_MTP
-    MtpInterface::explicitCriticalSection cs;
+    EntryCriticalSection cs;
     #endif
-    auto port_it = find_port_tag(sid, did, q->sport);
-    if (port_it == sender_src_port_map.end()) return;
-    flowTag = port_it->second;
+    const auto completion = sender_src_port_map.Complete(
+        sid, did, q->sport, SimAiNs3::CompletionSide::Send, flowTag);
+    if (completion != SimAiNs3::CompletionStatus::Recorded) {
+      NcclLog->writeLog(completion == SimAiNs3::CompletionStatus::Missing
+                           ? NcclLogLevel::WARNING : NcclLogLevel::DEBUG,
+          "ignored %s RDMA send completion src %u dst %u port %u",
+          completion == SimAiNs3::CompletionStatus::Missing ? "missing" : "duplicate",
+          sid, did, static_cast<unsigned>(q->sport));
+      return;
+    }
     FlowKey key = make_flow_key(flowTag, sid, did);
     sent_chunksize[key] += q->m_size;
     if(!is_sending_finished(sid,did,flowTag)) {

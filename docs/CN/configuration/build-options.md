@@ -39,7 +39,7 @@
 
 #### v2026 GPU trace 适配
 
-`example/cluster-trace-v2026-spot-gpu` 可通过调度层适配器转换为 FCFS manifest。适配器只读取 GPU 字段，忽略 CPU；每个 trace 节点固定按 8 张 GPU 计算，但任务 GPU 数严格保留为 `ceil(gpu_request * worker_num)`，不向上取整到 8 的倍数，`duration` 直接写入任务 workload 的 `ALLREDUCE` 通信量。提交时间默认按 trace 秒转换为 ns，`--arrival-scale` 可整体压缩或放大。
+`example/cluster-trace-v2026-spot-gpu` 可通过调度层适配器转换为 FCFS manifest。适配器只读取 GPU 字段，忽略 CPU；每个 trace 节点固定按 8 张 GPU 计算，但任务 GPU 数严格保留为 `ceil(gpu_request * worker_num)`，不向上取整到 8 的倍数，`duration` 直接写入任务 workload 的 `ALLREDUCE` 通信量。提交时间默认按 trace 秒转换为 ns，`--arrival-scale` 可整体压缩或放大。`--max-jobs` 会从 `job_info_df.csv` 的数据行（不含表头）中随机抽取至多指定数量；设为 `0` 时处理全部数据行。
 
 ```bash
 sh ./scripts/generate_cluster_trace_jobs.sh \
@@ -53,6 +53,23 @@ JOBS_FILE=./example/cluster-trace-v2026-spot-gpu/simai_fcfs/multi_jobs.csv \
 ```
 
 当前 `Spectrum-X_128g_8gps_100Gbps_A100` 拓扑按 128 张 GPU 运行，超过容量的任务默认跳过，统计写入 `trace_adapter_summary.json`。可用 `--total-gpus` 指定其他 GPU 总容量；`gpu_capacity_num` 仍固定按 8 使用。
+
+较大的通信量会在同一任务内拆为多条顺序执行的 `ALLREDUCE`。
+`--max-allreduce-bytes`（环境变量 `MAX_ALLREDUCE_BYTES`）默认 `1048576`，
+实际每条上限为 `min(该参数, 8192 × 任务 GPU 数)`。各段通信量之和严格等于
+原任务通信量；均分后不会因新增小尾段触发 4096 字节的运行时下限。
+原本不足 4096 字节的任务仍遵循已有下限行为。此策略针对当前 9000 字节 MTU
+和 Ring 模型，规避接近 MTU 的末包漏触发发送完成通知；增加 collective 次数也会
+增加启动开销，因此时延会变化。GPU 需求、到达时间和任务数量不受拆分影响。
+
+默认七列 CSV 可直接使用拆分文件。`--compact-csv` 仍保留总通信量供 Crux 使用，
+但需要重新编译前端，才能在启动时保留拆分内容。需重新生成 workload 才能应用此更改。
+
+```bash
+OUTPUT_DIR=./example/cluster-trace-v2026-spot-gpu/simai_split \
+MAX_ALLREDUCE_BYTES=1048576 \
+sh ./scripts/generate_cluster_trace_jobs.sh --max-jobs 300
+```
 
 ```bash
 ./bin/SimAI_simulator -t 16 -j ./example/multi_jobs.csv -p first-fit \
@@ -125,9 +142,38 @@ PLOT_DIR=./scheduler_plots \
   sh ./scripts/plot_scheduler_metrics.sh
 ```
 
-输出目录还包含资源占用与碎片化图：`resource_statistics.png`（分布统计）、`resource_occupancy_timeseries.png`（占用/碎片化时序）和 `resource_allocation_bubbles.png`（按 GPU 的资源时序气泡图）。`resource_timeseries.csv` 保存每个快照的资源指标，`resource_summary.csv` 保存均值、P50、P95 和最大值；`job_metrics.csv` 提供作业时延结构化数据。碎片化比例定义为空闲 GPU 中不属于最大连续空闲段的比例。绘图需要 Python `matplotlib`。
+默认关闭预热裁剪，从仿真起点绘图。可以使用 `--warmup-fraction 0.95` 在达到峰值 95% 时开始统计，或使用 `--warmup-time-ns` 指定精确时间。完整的 `job_metrics.csv` 会保留，筛选后的任务指标写入 `post_warmup/`。
+
+默认只输出 `gpu_schedule_timeline.png`（GPU 调度）、`job_latencies.png`（时延）和 `resource_occupancy_timeseries.png`（利用率、碎片率、活跃任务曲线）。时延柱状图默认显示最慢的 15 个任务并标注数字，直方图和 CSV 仍包含全部任务；用 `--max-latency-jobs` 调整柱状图任务数。`--details` 可额外生成分布统计、任务时间线、利用率和可选的热图、气泡图，原有 `--skip-heatmap`、`--skip-bubbles`、`--no-memory` 仍有效。复用目录时不会删除旧图片。
+
+密集折线默认按 60 个等时间窗口绘制时长加权均值，浅色阴影表示窗口内最小值到最大值，稀疏曲线保留原始状态。同一时间戳取最后一个资源快照，避免瞬时事件抖动。`--curve-bins 40` 可进一步简化趋势，`--curve-bins 0` 显示原始阶梯。平滑只影响图形；`resource_timeseries.csv`、`resource_summary.csv`、`job_metrics.csv` 仍使用原始数据。碎片化比例定义为空闲 GPU 中不属于最大连续空闲段的比例。绘图需要 Python `matplotlib`。
 
 显存容量配置为非零值时，气泡大小还会反映显存占用比例；容量为零时，气泡表示 GPU 忙碌样本。大日志可通过 `--max-bubbles 20000` 限制气泡采样点数。
+
+#### 多策略对比
+
+使用 `scripts/compare_scheduler_policies.sh` 对同一任务 manifest 运行多种策略。每种策略使用独立的 manifest 和 workload 副本，仿真输出、调度日志、任务输出和图表也分别保存。
+
+```bash
+JOBS_FILE=./example/cluster-trace-v2026-spot-gpu/multi_jobs.csv \
+POLICIES=fcfs,first-fit,best-fit,fgd,crux \
+COMPARISON_ROOT=./scheduler_comparisons \
+./scripts/run_multi_jobs.sh
+```
+
+每次运行会创建带时间戳的结果目录。`comparison_metadata.json` 记录源 manifest 的 SHA-256、拓扑和配置；`comparison_summary.csv` 汇总状态、预热后完成数、端到端时延均值/P50/P95、排队/执行时延、GPU 占用和碎片率。最终对比图片包括：`comparison_metrics.png`（总览）、`comparison_latency.png`（端到端及排队/执行时延）、`comparison_utilization.png`（GPU 占用率曲线和均值）、`comparison_fragmentation.png`（碎片化率曲线和均值）。所有策略使用各自预热结束时刻中的最晚时间作为共同统计起点。某个策略失败会被记录，其他策略仍继续运行；添加 `--stop-on-error` 可在首次失败时停止。
+
+对比统计柱状图会标注数值，时延统一用 ms；总览不再重复绘制利用率和碎片率折线，这两项在各自独立图片中展示。运行多算法脚本时，可设置 `PLOT_CURVE_BINS=40`、`PLOT_MAX_LATENCY_JOBS=15`，同时控制各算法和最终对比图；`PLOT_DETAILS=1` 开启各算法的额外明细图。
+
+所有 shell 入口已统一这些参数；不设置 `WARMUP_TIME_NS` 或 `WARMUP_FRACTION` 时关闭预热。单算法绘图脚本还支持 `PLOT_DPI`，默认跳过显存、热图和气泡图。已有多算法实验可直接离线重绘，无需再次仿真：
+
+```bash
+COMPARISON_DIR=./scheduler_comparisons/test \
+POLICIES=fcfs,fgd,crux PLOT_CURVE_BINS=40 PLOT_MAX_LATENCY_JOBS=15 \
+sh ./scripts/plot_scheduler_comparison.sh
+```
+
+该命令更新各算法的 `scheduler_plots/` 和实验根目录的四张对比图，重绘参数和指标单独写入 `replot_summary.json`，不修改原始仿真日志与仿真摘要。省略 `POLICIES` 会自动发现已有日志的策略。尚未完成的日志也可绘制，但只代表已记录的任务结果。
 
 典型用法：
 ```bash

@@ -39,7 +39,7 @@ Pass a CSV job manifest with `-j` to run independent AICB/SimAI workloads in one
 
 #### v2026 GPU trace adapter
 
-Convert `example/cluster-trace-v2026-spot-gpu` at the scheduling layer with the FCFS adapter. It reads GPU fields only and ignores CPU; every trace node is treated as having 8 GPUs, while each job keeps the exact `ceil(gpu_request * worker_num)` GPU request instead of rounding to a multiple of 8. `duration` is written into the task workload's `ALLREDUCE` communication amount. Trace submit seconds are converted to ns; use `--arrival-scale` to compress or expand the arrival timeline.
+Convert `example/cluster-trace-v2026-spot-gpu` at the scheduling layer with the FCFS adapter. It reads GPU fields only and ignores CPU; every trace node is treated as having 8 GPUs, while each job keeps the exact `ceil(gpu_request * worker_num)` GPU request instead of rounding to a multiple of 8. `duration` is written into the task workload's `ALLREDUCE` communication amount. Trace submit seconds are converted to ns; use `--arrival-scale` to compress or expand the arrival timeline. `--max-jobs` randomly selects up to that many data rows from `job_info_df.csv` (the header is excluded); `0` processes all rows.
 
 ```bash
 sh ./scripts/generate_cluster_trace_jobs.sh \
@@ -125,9 +125,24 @@ PLOT_DIR=./scheduler_plots \
   sh ./scripts/plot_scheduler_metrics.sh
 ```
 
+Plots start after warmup by default: the first scheduler snapshot reaching the peak observed GPU occupancy is used as the warmup boundary. Use `--warmup-fraction 0.95` to start at the first snapshot reaching 95% of peak occupancy, or pass an exact boundary with `--warmup-time-ns`. The original complete `job_metrics.csv` is preserved; post-warmup metrics are written under `post_warmup/`.
+
 The output directory also contains resource occupancy and fragmentation plots: `resource_statistics.png` (distributions), `resource_occupancy_timeseries.png` (occupancy/fragmentation over time), and `resource_allocation_bubbles.png` (per-GPU resource bubbles over time). `resource_timeseries.csv` stores per-snapshot resource metrics, while `resource_summary.csv` stores mean, P50, P95, and maximum values. `job_metrics.csv` provides structured job latency data. Fragmentation is defined as the fraction of free GPUs outside the largest contiguous free-GPU run. Plotting requires Python `matplotlib`.
 
 When non-zero GPU memory capacities are configured, bubble size also reflects memory occupancy; otherwise bubbles represent busy-GPU samples. For large logs, limit bubble samples with `--max-bubbles 20000`.
+
+#### Policy comparison
+
+Use `scripts/compare_scheduler_policies.sh` to replay one job manifest with several policies. Each policy receives a private copy of the manifest and workloads and writes its simulator output, scheduler log, per-job output, and plots to a separate directory.
+
+```bash
+JOBS_FILE=./example/cluster-trace-v2026-spot-gpu/multi_jobs.csv \
+POLICIES=fcfs,first-fit,best-fit,fgd,crux \
+COMPARISON_ROOT=./scheduler_comparisons \
+./scripts/run_multi_jobs.sh
+```
+
+Each run creates a timestamped directory. `comparison_metadata.json` records the source manifest SHA-256 and shared topology/config. `comparison_summary.csv` reports status, post-warmup completed-job count, mean/P50/P95 end-to-end latency, queue/service latency, GPU allocation, and fragmentation. The final comparison figures are `comparison_metrics.png` (combined dashboard), `comparison_latency.png` (E2E and queue/service latency), `comparison_utilization.png` (GPU allocation curve and mean), and `comparison_fragmentation.png` (fragmentation curve and mean). All policies use the latest detected warmup completion time as a common measurement boundary. A failed policy is recorded while the remaining policies continue; pass `--stop-on-error` to stop at the first failure.
 
 Typical usage:
 ```bash
